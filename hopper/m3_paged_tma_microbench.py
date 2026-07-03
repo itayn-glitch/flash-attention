@@ -113,7 +113,9 @@ def main():
     # Replay 100x; mutate q between replays to prove the graph recomputes (not a cached result).
     graph.replay(); torch.cuda.synchronize()
     rep0 = captured.clone()
-    q.mul_(1.5)  # change input in-place; a real graph must reflect it on next replay
+    # Replace q in-place with a clearly different, larger-magnitude input so the softmax
+    # (hence output) MUST move well past tolerance -- proves the graph recomputes.
+    q.copy_(torch.randn_like(q))
     graph.replay(); torch.cuda.synchronize()
     rep1 = captured.clone()
     eager_scaled = run_kernel(fa, q, kc, vc, pt, cs, scale)  # eager on mutated q
