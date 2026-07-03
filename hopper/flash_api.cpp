@@ -789,8 +789,11 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                     "FlashAttention on Ampere/Ada cards only supports fp16 and bf16 data type");
     }
-    TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
-    TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
+    // M5 dequant-on-load: bf16 query + fp8(e4m3) KV cache is allowed (kernel upcasts KV to
+    // bf16 in the load path). Otherwise q/k/v dtypes must match.
+    bool const kv_dequant = (k.scalar_type() == at::ScalarType::Float8_e4m3fn) && (q_type == at::ScalarType::BFloat16);
+    TORCH_CHECK(k.scalar_type() == q_type || kv_dequant, "query and key must have the same dtype (or bf16 query + fp8_e4m3 KV for dequant-on-load)");
+    TORCH_CHECK(v.scalar_type() == k.scalar_type(), "key and value must have the same dtype");
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
 
