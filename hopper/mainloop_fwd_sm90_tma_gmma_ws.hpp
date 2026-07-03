@@ -836,6 +836,7 @@ struct CollectiveMainloopFwdSm90 {
         // same logical positions; vectorized LDS fp8->regs, convert+descale in regs, vectorized STS.
         // val=8 elems: fp8 8=64b LDS, bf16 8=128b STS. thr=(kBlockN, NumProducerThreads/kBlockN).
         auto convert_tile = [&] (auto&& sf, auto&& sb, float descale) {
+          if constexpr (DequantKV) {   // gate: NumProducerThreads/kBlockN is degenerate on the non-dequant TMA path
             auto thr_l = Layout<Shape<Int<kBlockN>, Int<NumProducerThreads / kBlockN>>>{};
             auto val_l = Layout<Shape<_1, _8>>{};
             auto tcf = make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<64>, ElementKV>{}, thr_l, val_l);
@@ -848,6 +849,7 @@ struct CollectiveMainloopFwdSm90 {
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < size(rf); ++j) { rb(j) = static_cast<Element>(float(rf(j)) * descale); }
             cute::copy(tcb, rb, tsb);
+          }
         };
         auto convert_K_stage = [&] (int stage) {
             if constexpr (DequantKV) {
