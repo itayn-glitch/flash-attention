@@ -30,12 +30,19 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_, int kBlockH_=1>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_, int kBlockH_=1,
+        // ElementKV = KV-cache STORAGE/load dtype, decoupled from Element (the MMA compute
+        // dtype). Default == Element (no-op). Set to e4m3 with Element=bf16 for the head-512
+        // "dequant-on-load" path (M5 option 2): read 1-byte fp8 from HBM, upcast->bf16 in the
+        // producer, keep bf16 wgmma (so MmaPV=SS / LargeHeadDimV stays valid, unlike native fp8).
+        class ElementKV_ = Element_>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
     using ClusterShape = ClusterShape_;
     using TileShape_MNK = TileShape_MNK_;
+    using ElementKV = ElementKV_;
+    static constexpr bool DequantKV = !cute::is_same_v<ElementKV, Element_>;  // fp8 storage, bf16 compute
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
