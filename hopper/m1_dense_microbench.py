@@ -18,6 +18,7 @@ PEAK_BW_GBPS = 3350.0
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seqlen", type=int, default=9216)      # ~prod avg KV
+    ap.add_argument("--batch", type=int, default=1)          # raise to fill SMs (decode occupancy)
     ap.add_argument("--nheads", type=int, default=32)         # Gemma4: 4 kv x 8
     ap.add_argument("--nheads_k", type=int, default=4)
     ap.add_argument("--headdim", type=int, default=512)
@@ -29,7 +30,7 @@ def main():
 
     dev = "cuda"
     dt = torch.bfloat16
-    b, sq, sk, h, hk, d = 1, 1, args.seqlen, args.nheads, args.nheads_k, args.headdim
+    b, sq, sk, h, hk, d = args.batch, 1, args.seqlen, args.nheads, args.nheads_k, args.headdim
     torch.manual_seed(0)
     q = torch.randn(b, sq, h, d, device=dev, dtype=dt) * 0.1
     k = torch.randn(b, sk, hk, d, device=dev, dtype=dt) * 0.1
@@ -52,7 +53,7 @@ def main():
         print("OUTPUT NOT FINITE"); sys.exit(3)
 
     # Bytes moved: dominant term is the KV read (q=1 decode reads all KV once).
-    kv_bytes = 2 * sk * hk * d * q.element_size()   # K + V
+    kv_bytes = 2 * b * sk * hk * d * q.element_size()   # K + V, per batch element
     q_bytes = b * sq * h * d * q.element_size()
     o_bytes = b * sq * h * d * q.element_size()
     total_bytes = kv_bytes + q_bytes + o_bytes
