@@ -399,6 +399,10 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             #ifndef FLASHATTENTION_DISABLE_HDIM256
                             if (params.d <= 256) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                             #endif
+                            #ifndef FLASHATTENTION_DISABLE_HDIM512
+                            // Square head-512 fp8 (Gemma4 global). Already sm90-only in this block.
+                            if (params.d <= 512) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 512, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+                            #endif
                             #else
                             TORCH_CHECK(false, "This flash attention build does not support FP8.");
                             #endif

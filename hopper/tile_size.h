@@ -59,6 +59,12 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         }
     } else {
         // FP8 path
+        if (headdim > 256) {
+            // Square head-512 fp8 (Gemma4 global). LargeHeadDimV forces kBlockM<=64 and
+            // MmaPV_is_RS=false; fp8 K+V is 1B so 2 stages fit in 228KB (kStages set in
+            // the launch template by element size). OQ2 fp8 enabler path.
+            return {64, 64, false, false};
+        }
         if (use_one_mma_wg) {
             // Decode tiles — independent of two-level accumulation setting
             if (headdim <= 96) {

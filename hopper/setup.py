@@ -564,9 +564,10 @@ if not SKIP_CUDA_BUILD:
     #                     for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
     #                     if not (packgqa and (paged or split))]
     if not DISABLE_HDIM512:
-        # Square head-512 (Gemma4 global). bf16-only for now (fp8 deferred to M5).
+        # Square head-512 (Gemma4 global): bf16 (M1-M4) + e4m3 (M5 native fp8, when enabled).
+        HDIM512_DTYPES = ["bf16"] + (["e4m3"] if not DISABLE_FP8 else [])
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim512_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
-                             for dtype, split, paged, softcap, packgqa in itertools.product(["bf16"], SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
+                             for dtype, split, paged, softcap, packgqa in itertools.product(HDIM512_DTYPES, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
                              if not (packgqa and (paged or split)) and (not PACKGQA_ONLY or packgqa or paged or split)]
     if not DISABLE_HDIMDIFF64:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
