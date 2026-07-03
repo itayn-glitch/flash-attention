@@ -884,21 +884,25 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
-            pipeline_k.producer_acquire(smem_pipe_write);
+            // NOTE: producer_acquire is per-branch: the DequantKV route acquires the fp8 STAGING
+            // pipeline (smem_pipe_write is the fp8 state there), NOT the bf16 pipeline_k -- the bf16
+            // pipeline is acquired later, in convert_KV. Acquiring pipeline_k here would double-acquire
+            // and mistype the state (PipelineStateFp8 vs PipelineState).
             if constexpr (!PagedKVNonTMA) {
+                pipeline_k.producer_acquire(smem_pipe_write);
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
                     tKgK_TMA(_, n_block_idx, bidb_kv_idx), tKsK_TMA(_, smem_pipe_write.index()));
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
                 if constexpr (DequantKV) {
-                    // B3-fast.2: async cp.async fp8 -> fp8 STAGING pipeline (kStagesFp8), no wait/convert
-                    // here (the convert stage runs one block behind so this load stays in flight).
-                    // NOTE: for DequantKV the caller passes the fp8 write-state as smem_pipe_write.
+                    // async cp.async fp8 -> fp8 STAGING pipeline (kStagesFp8), no wait/convert here
+                    // (the convert stage runs one block behind so this load stays in flight).
                     pipeline_k_fp8.producer_acquire(smem_pipe_write);
                     paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_fp8_stage(smem_pipe_write.index()));
                     pipeline_k_fp8.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
                 } else {
+                    pipeline_k.producer_acquire(smem_pipe_write);
                     paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_pi(_, _, smem_pipe_write.index()));
                     pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
                 }
@@ -906,20 +910,23 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         auto load_V = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
-            auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
-            pipeline_v_load.producer_acquire(smem_pipe_write);
+            // producer_acquire is per-branch (see load_K): DequantKV acquires the fp8 STAGING pipeline.
             if constexpr (!PagedKVNonTMA) {
+                auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
+                pipeline_v_load.producer_acquire(smem_pipe_write);
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_V_TMA();
                 copy(params.tma_load_V.with(*pipeline_v_load.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
                     tVgVt_TMA(_, n_block_idx, bidb_kv_idx), tVsVt_TMA(_, smem_pipe_write.index()));
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
                 if constexpr (DequantKV) {
-                    // B3-fast.2: async cp.async fp8 -> fp8 STAGING pipeline. smem_pipe_write == fp8 write-state.
+                    // async cp.async fp8 -> fp8 STAGING pipeline. smem_pipe_write == fp8 write-state.
                     pipeline_v_fp8.producer_acquire(smem_pipe_write);
                     paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sV_fp8_stage(smem_pipe_write.index()));
                     pipeline_v_fp8.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
                 } else {
+                    auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
+                    pipeline_v_load.producer_acquire(smem_pipe_write);
                     paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sVcpasync(_, _, smem_pipe_write.index()));
                     pipeline_v_load.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
                 }
