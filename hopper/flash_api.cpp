@@ -1208,7 +1208,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         params.lseaccum_head_stride = softmax_lse_accum.stride(-2);
     }
 
-    if (q_type == at::ScalarType::Float8_e4m3fn) {
+    // M5 dequant-on-load also needs k/v descale wired (q stays bf16 -> q_descale unused).
+    if (q_type == at::ScalarType::Float8_e4m3fn || kv_dequant) {
         if (q_descale_.has_value()) {
             auto q_descale = q_descale_.value();
             CHECK_DEVICE(q_descale);
