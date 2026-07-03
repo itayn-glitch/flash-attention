@@ -830,22 +830,35 @@ struct CollectiveMainloopFwdSm90 {
         // linear index maps through each tensor's own layout). Vectorize (fp8x4->bf16x2) later.
         // All fp8-staging tensors are constructed INSIDE these gated branches so the bf16
         // build (DequantKV=false) never instantiates a view over the 0-size staging array.
+        // B3-fast: VECTORIZED convert via CuTe tiled copies (swizzle-safe -- NOT a raw fp8x4 cast,
+        // since fp8/bf16 use different swizzle atoms). Partition fp8 src & bf16 dst with the SAME
+        // thread/value layout over the (kBlockN,kHeadDim) tile so per-thread elements map to the
+        // same logical positions; vectorized LDS fp8->regs, convert+descale in regs, vectorized STS.
+        // val=8 elems: fp8 8=64b LDS, bf16 8=128b STS. thr=(kBlockN, NumProducerThreads/kBlockN).
+        auto convert_tile = [&] (auto&& sf, auto&& sb, float descale) {
+            auto thr_l = Layout<Shape<Int<kBlockN>, Int<NumProducerThreads / kBlockN>>>{};
+            auto val_l = Layout<Shape<_1, _8>>{};
+            auto tcf = make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<64>, ElementKV>{}, thr_l, val_l);
+            auto tcb = make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{}, thr_l, val_l);
+            Tensor tsf = tcf.get_thread_slice(thread_idx).partition_S(sf);
+            Tensor tsb = tcb.get_thread_slice(thread_idx).partition_D(sb);
+            Tensor rf = make_fragment_like(tsf);
+            Tensor rb = make_fragment_like(tsb);
+            cute::copy(tcf, tsf, rf);
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < size(rf); ++j) { rb(j) = static_cast<Element>(float(rf(j)) * descale); }
+            cute::copy(tcb, rb, tsb);
+        };
         auto convert_K_stage = [&] (int stage) {
             if constexpr (DequantKV) {
                 Tensor sKf = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k_fp8.data()), SmemLayoutKFp8{}))(_, _, stage);
-                Tensor sKb = sK_pi(_, _, stage);
-                for (int i = thread_idx; i < size(sKf); i += NumProducerThreads) {
-                    sKb(i) = static_cast<Element>(float(sKf(i)) * k_descale_val);
-                }
+                convert_tile(sKf, sK_pi(_, _, stage), k_descale_val);
             }
         };
         auto convert_V_stage = [&] (int stage) {
             if constexpr (DequantKV) {
                 Tensor sVf = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_fp8.data()), SmemLayoutVFp8{}))(_, _, stage);
-                Tensor sVb = sVcpasync(_, _, stage);
-                for (int i = thread_idx; i < size(sVf); i += NumProducerThreads) {
-                    sVb(i) = static_cast<Element>(float(sVf(i)) * v_descale_val);
-                }
+                convert_tile(sVf, sVcpasync(_, _, stage), v_descale_val);
             }
         };
         // fp8 staging targets for the paged cp.async loads (also gated).
