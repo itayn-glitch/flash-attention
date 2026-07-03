@@ -43,6 +43,10 @@ struct CollectiveMainloopFwdSm90 {
     using TileShape_MNK = TileShape_MNK_;
     using ElementKV = ElementKV_;
     static constexpr bool DequantKV = !cute::is_same_v<ElementKV, Element_>;  // fp8 storage, bf16 compute
+    // M5 B3-fast.2: the fp8 STAGING pipeline needs MORE stages than the bf16 target so the
+    // cp.async load of stage n+1 stays in flight while stage n is converted+consumed (the bf16
+    // target stays kStages=1 for smem budget at kBlockN=32; separate counts, NOT global kStages=2).
+    static constexpr int kStagesFp8 = DequantKV ? kStages + 1 : kStages;
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
@@ -183,12 +187,12 @@ struct CollectiveMainloopFwdSm90 {
         decltype(cute::get<1>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutKFp8 = decltype(tile_to_shape(
         SmemLayoutAtomKFp8{},
-        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
+        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStagesFp8>{})));
     using SmemLayoutAtomVFp8 = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementKV,
         decltype(cute::get<1>(TileShape_MNK{})), Int<kHeadDimV>>());
     using SmemLayoutVFp8 = decltype(tile_to_shape(
         SmemLayoutAtomVFp8{},
-        make_shape(shape<1>(TileShape_MNK{}), Int<kHeadDimV>{}, Int<kStages>{})));
+        make_shape(shape<1>(TileShape_MNK{}), Int<kHeadDimV>{}, Int<kStagesFp8>{})));
 
     using SmemLayoutAtomP = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
@@ -320,6 +324,11 @@ struct CollectiveMainloopFwdSm90 {
     // We always use TMA for K_new and V_new
     using MainloopPipelineKVNew = PipelineTmaAsync;
     using PipelineState = cutlass::PipelineState<kStages>;
+    // M5 B3-fast.2: fp8 staging pipelines (cp.async -> fp8 smem, consumed by the producer-WG
+    // convert stage). Always PipelineAsync (DequantKV is a cp.async/paged path). Own stage count.
+    using MainloopPipelineKFp8 = cutlass::PipelineAsync<kStagesFp8>;
+    using MainloopPipelineVFp8 = cutlass::PipelineAsync<kStagesFp8>;
+    using PipelineStateFp8 = cutlass::PipelineState<kStagesFp8>;
 
     // If PackGQA, we use cp.async (instead of TMA) to load Q, so we want smem_q to be aligned
     // and have sQ being position_independent_swizzle_tensor.
@@ -648,7 +657,10 @@ struct CollectiveMainloopFwdSm90 {
          MainloopPipelineK pipeline_k,
          MainloopPipelineV pipeline_v,
          MainloopPipelineVt pipeline_vt,
+         MainloopPipelineKFp8 pipeline_k_fp8,
+         MainloopPipelineVFp8 pipeline_v_fp8,
          PipelineState& smem_pipe_write,
+         PipelineStateFp8& smem_pipe_write_fp8,
          SharedStorage &shared_storage,
          SchedulerPrefetch const& scheduler_prefetch,
          SeqlenInfo_t const& seqlen_info,
@@ -851,16 +863,16 @@ struct CollectiveMainloopFwdSm90 {
             cute::copy(tcb, rb, tsb);
           }
         };
-        auto convert_K_stage = [&] (int stage) {
+        auto convert_K_stage = [&] (int fp8_stage, int bf16_stage) {
             if constexpr (DequantKV) {
-                Tensor sKf = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k_fp8.data()), SmemLayoutKFp8{}))(_, _, stage);
-                convert_tile(sKf, sK_pi(_, _, stage), k_descale_val);
+                Tensor sKf = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k_fp8.data()), SmemLayoutKFp8{}))(_, _, fp8_stage);
+                convert_tile(sKf, sK_pi(_, _, bf16_stage), k_descale_val);
             }
         };
-        auto convert_V_stage = [&] (int stage) {
+        auto convert_V_stage = [&] (int fp8_stage, int bf16_stage) {
             if constexpr (DequantKV) {
-                Tensor sVf = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_fp8.data()), SmemLayoutVFp8{}))(_, _, stage);
-                convert_tile(sVf, sVcpasync(_, _, stage), v_descale_val);
+                Tensor sVf = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_fp8.data()), SmemLayoutVFp8{}))(_, _, fp8_stage);
+                convert_tile(sVf, sVcpasync(_, _, bf16_stage), v_descale_val);
             }
         };
         // fp8 staging targets for the paged cp.async loads (also gated).
@@ -880,15 +892,12 @@ struct CollectiveMainloopFwdSm90 {
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
                 if constexpr (DequantKV) {
-                    // cp.async fp8 -> fp8 staging, wait, sync producer threads, convert -> bf16 smem_k,
-                    // then a PLAIN producer_commit (not cpasync arrive) since the convert wrote smem.
+                    // B3-fast.2: async cp.async fp8 -> fp8 STAGING pipeline (kStagesFp8), no wait/convert
+                    // here (the convert stage runs one block behind so this load stays in flight).
+                    // NOTE: for DequantKV the caller passes the fp8 write-state as smem_pipe_write.
+                    pipeline_k_fp8.producer_acquire(smem_pipe_write);
                     paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_fp8_stage(smem_pipe_write.index()));
-                    cute::cp_async_fence();
-                    flash::cp_async_wait<0>();
-                    cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::ProducerConvert) /*id*/);
-                    convert_K_stage(smem_pipe_write.index());
-                    cutlass::arch::fence_view_async_shared();
-                    pipeline_k.producer_commit(smem_pipe_write);
+                    pipeline_k_fp8.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
                 } else {
                     paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_pi(_, _, smem_pipe_write.index()));
                     pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
@@ -906,13 +915,10 @@ struct CollectiveMainloopFwdSm90 {
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
                 if constexpr (DequantKV) {
+                    // B3-fast.2: async cp.async fp8 -> fp8 STAGING pipeline. smem_pipe_write == fp8 write-state.
+                    pipeline_v_fp8.producer_acquire(smem_pipe_write);
                     paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sV_fp8_stage(smem_pipe_write.index()));
-                    cute::cp_async_fence();
-                    flash::cp_async_wait<0>();
-                    cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::ProducerConvert) /*id*/);
-                    convert_V_stage(smem_pipe_write.index());
-                    cutlass::arch::fence_view_async_shared();
-                    pipeline_v_load.producer_commit(smem_pipe_write);
+                    pipeline_v_fp8.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
                 } else {
                     paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sVcpasync(_, _, smem_pipe_write.index()));
                     pipeline_v_load.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
@@ -937,6 +943,30 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_vt.consumer_release(smem_pipe_read);
         };
 
+        // B3-fast.2 DequantKV convert stage (mirrors copy_Vt_to_V): the producer WG consumes one fp8
+        // staging stage (K and V), upcasts+descales -> the bf16 pipeline the MMA WG reads. Runs one
+        // block behind the fp8 load so the next block's cp.async stays in flight during convert+MMA.
+        // `fp8_write` is the fp8 producer-state used when this block was loaded; reconstruct the
+        // consumer read-state from it (phase^1) exactly as copy_Vt_to_V does for pipeline_vt.
+        auto convert_KV = [&] (auto const& fp8_write, auto const& bf16_write) {
+            if constexpr (DequantKV) {
+                PipelineStateFp8 fp8_read{fp8_write.index(), fp8_write.phase() ^ 1, fp8_write.count()};
+                pipeline_k_fp8.consumer_wait(fp8_read);
+                pipeline_v_fp8.consumer_wait(fp8_read);
+                pipeline_k.producer_acquire(bf16_write);
+                pipeline_v.producer_acquire(bf16_write);
+                convert_K_stage(fp8_read.index(), bf16_write.index());
+                convert_V_stage(fp8_read.index(), bf16_write.index());
+                cutlass::arch::fence_view_async_shared();
+                pipeline_k.producer_commit(bf16_write);
+                pipeline_v.producer_commit(bf16_write);
+                // All producer threads must finish reading fp8 smem before the staging stage is reused.
+                cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::ProducerConvert) /*id*/);
+                pipeline_k_fp8.consumer_release(fp8_read);
+                pipeline_v_fp8.consumer_release(fp8_read);
+            }
+        };
+
         int n_block = n_block_max - 1;
 
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
@@ -944,103 +974,142 @@ struct CollectiveMainloopFwdSm90 {
         static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
         bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync());
 
-        if (should_load_KV) {
-            if constexpr (PagedKVNonTMA) {
-                paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
-            } else {
-                paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
-            }
-            if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
-            // if (thread_idx == 0) { printf("Producer: main load, before load_K, index = %d\n", smem_pipe_write.index());}
-            load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
-            // if (thread_idx == 0) { printf("Producer: main load, after load K, index = %d\n", smem_pipe_write.index());}
-        }
-
-        if constexpr (Use_TMA_Q) {
-            // Wait for the MMA warpgroups to signal that smem_q is ready
-            if (SingleProducerWarp || warp_idx_in_warpgroup == 0) {
-                cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
-            }
-
-            if ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()) {
-                shared_storage.pipelines.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
-                copy(params.tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
-                    tQgQ, tQsQ);
-                if constexpr (HasQv) {
-                    shared_storage.pipelines.barrier_Qv.arrive_and_expect_tx(TmaTransactionBytesQv);
-                    copy(params.tma_load_Qv.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Qv), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
-                        tQvgQv, tQvsQv);
+        // Q load is shared by both paths (it does not touch the KV pipelines). Extracted to a lambda
+        // so the DequantKV software-pipeline and the stock path can each place it at the same point.
+        auto load_Q = [&] {
+            if constexpr (Use_TMA_Q) {
+                // Wait for the MMA warpgroups to signal that smem_q is ready
+                if (SingleProducerWarp || warp_idx_in_warpgroup == 0) {
+                    cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
                 }
-            }
-        } else {  // Load Q with cp.async
-            cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
-            Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
-            Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
-            using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumProducerThreads, Element>;
-            PackGQAt::load_Q(mQ, sQ_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
-            auto &barrier_Q = shared_storage.pipelines.barrier_Q;
-            cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Q));
-            barrier_Q.arrive();
-            if constexpr (HasQv) {
-                Tensor mQv = make_tensor(make_gmem_ptr(params.ptr_Qv + seqlen_info.offset_q * get<0>(params.stride_Qv)), params.shape_Qv_packed, params.stride_Qv_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
-                Tensor sQv_pi = cute::as_position_independent_swizzle_tensor(sQv);
-                using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK_QV{}), get<2>(TileShape_MNK_QV{}), NumProducerThreads, Element>;
-                PackGQAt::load_Q(mQv, sQv_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
-                auto &barrier_Qv = shared_storage.pipelines.barrier_Qv;
-                cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Qv));
-                barrier_Qv.arrive();
-            }
-        }
-
-        // Wait for the MMA WGs to signal that smem_v are ready and V can be copied from gmem
-        // Need ClusterBarrier, not just NamedBarrier. Otherwise we might have CTA 0 finishing the
-        // TMA store on O first, call TMA multicast load on V, before CTA 1 can finishing TMA store on O.
-        // if (thread_idx == 0) { printf("Producer: main load, before barrier_O, work_idx = %d\n", work_idx);}
-        shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
-        // if (thread_idx == 0) { printf("Producer: main load, after barrier_O\n");}
-
-        if constexpr (!Transpose_V && !IntraWGOverlap) {
-            if (should_load_KV) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
-        }
-        int n_block_prev = n_block;
-        --n_block;
-        #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
-        for (; n_block >= n_block_min; --n_block) {
-            PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
-            ++smem_pipe_write;
-            if (should_load_KV) {
-                if constexpr (PagedKVNonTMA) {
-                    paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
-                } else {
-                    paged_kv_manager.load_page_table_TMA(n_block);
-                }
-                if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
-                load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
-                if constexpr (!Transpose_V) {
-                    if constexpr (IntraWGOverlap) {
-                        load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/);
-                    } else {
-                        load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
+                if ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()) {
+                    shared_storage.pipelines.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
+                    copy(params.tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
+                        tQgQ, tQsQ);
+                    if constexpr (HasQv) {
+                        shared_storage.pipelines.barrier_Qv.arrive_and_expect_tx(TmaTransactionBytesQv);
+                        copy(params.tma_load_Qv.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Qv), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
+                            tQvgQv, tQvsQv);
                     }
                 }
+            } else {  // Load Q with cp.async
+                cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
+                Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
+                Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
+                using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumProducerThreads, Element>;
+                PackGQAt::load_Q(mQ, sQ_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
+                auto &barrier_Q = shared_storage.pipelines.barrier_Q;
+                cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Q));
+                barrier_Q.arrive();
+                if constexpr (HasQv) {
+                    Tensor mQv = make_tensor(make_gmem_ptr(params.ptr_Qv + seqlen_info.offset_q * get<0>(params.stride_Qv)), params.shape_Qv_packed, params.stride_Qv_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
+                    Tensor sQv_pi = cute::as_position_independent_swizzle_tensor(sQv);
+                    using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK_QV{}), get<2>(TileShape_MNK_QV{}), NumProducerThreads, Element>;
+                    PackGQAt::load_Q(mQv, sQv_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
+                    auto &barrier_Qv = shared_storage.pipelines.barrier_Qv;
+                    cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Qv));
+                    barrier_Qv.arrive();
+                }
             }
-            n_block_prev = n_block;
-            if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
+        };
+
+        if constexpr (DequantKV) {
+            // ---- B3-fast.2: software-pipelined fp8 dequant load ----
+            // Load block n's fp8 K & V (into one fp8 staging stage, kStagesFp8) via async cp.async,
+            // then convert the PREVIOUS block fp8->bf16 (into the kStages=1 bf16 pipeline the MMA reads).
+            // The convert runs one block behind the load, so block n's cp.async stays in flight while
+            // block n+1 is converted+consumed -> DRAM load overlaps convert+MMA (the missing overlap).
+            if (should_load_KV) {
+                paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
+                load_V(n_block, smem_pipe_write_fp8, cute::true_type{} /*Seqlenk_mask*/);
+                load_K(n_block, smem_pipe_write_fp8, cute::true_type{} /*Seqlenk_mask*/);
+            }
+            PipelineStateFp8 fp8_write_convert = smem_pipe_write_fp8;  // fp8 write-state of the block pending convert
+            ++smem_pipe_write_fp8;
+
+            load_Q();
+            shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
+
+            --n_block;
+            #pragma unroll 1
+            for (; n_block >= n_block_min; --n_block) {
+                if (should_load_KV) {
+                    paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
+                    load_V(n_block, smem_pipe_write_fp8, cute::false_type{} /*Seqlenk_mask*/);
+                    load_K(n_block, smem_pipe_write_fp8, cute::false_type{} /*Seqlenk_mask*/);
+                }
+                convert_KV(fp8_write_convert, smem_pipe_write);  // convert prev block; overlaps loads above
+                fp8_write_convert = smem_pipe_write_fp8;
+                ++smem_pipe_write_fp8;
+                ++smem_pipe_write;
+            }
+            scheduler_prefetch();
+            convert_KV(fp8_write_convert, smem_pipe_write);  // epilogue: convert the last loaded block
+            ++smem_pipe_write;
+            ++work_idx;
+        } else {
+            if (should_load_KV) {
+                if constexpr (PagedKVNonTMA) {
+                    paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
+                } else {
+                    paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
+                }
+                if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+                load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
+            }
+
+            load_Q();
+
+            // Wait for the MMA WGs to signal that smem_v are ready and V can be copied from gmem
+            // Need ClusterBarrier, not just NamedBarrier. Otherwise we might have CTA 0 finishing the
+            // TMA store on O first, call TMA multicast load on V, before CTA 1 can finishing TMA store on O.
+            shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
+
+            if constexpr (!Transpose_V && !IntraWGOverlap) {
+                if (should_load_KV) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+            }
+            int n_block_prev = n_block;
+            --n_block;
+            #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
+            for (; n_block >= n_block_min; --n_block) {
+                PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
+                ++smem_pipe_write;
+                if (should_load_KV) {
+                    if constexpr (PagedKVNonTMA) {
+                        paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
+                    } else {
+                        paged_kv_manager.load_page_table_TMA(n_block);
+                    }
+                    if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
+                    load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
+                    if constexpr (!Transpose_V) {
+                        if constexpr (IntraWGOverlap) {
+                            load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/);
+                        } else {
+                            load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
+                        }
+                    }
+                }
+                n_block_prev = n_block;
+                if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
+            }
+            scheduler_prefetch();
+            if constexpr (!Transpose_V && IntraWGOverlap) {
+                if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+            }
+            if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
+            ++smem_pipe_write;
+            // At the end, all threads have the correct smem_pipe_write.
+            ++work_idx;
         }
-        scheduler_prefetch();
-        if constexpr (!Transpose_V && IntraWGOverlap) {
-            if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
-        }
-        if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
-        ++smem_pipe_write;
-        // At the end, all threads have the correct smem_pipe_write.
-        ++work_idx;
     }
 
     template <typename SharedStorage>
     CUTLASS_DEVICE void
     load_tail(MainloopPipelineK pipeline_k, MainloopPipelineV pipeline_v, MainloopPipelineVt pipeline_vt,
-              PipelineState& smem_pipe_write, SharedStorage &shared_storage, int const work_idx) {
+              MainloopPipelineKFp8 pipeline_k_fp8, MainloopPipelineVFp8 pipeline_v_fp8,
+              PipelineState& smem_pipe_write, PipelineStateFp8& smem_pipe_write_fp8,
+              SharedStorage &shared_storage, int const work_idx) {
         // If we don't wait for barrier_O here, when using Cluster, CTA0 might exit early and CTA1 will
         // try to arrive on barrier_O of CTA0, causing "unspecified launch failure".
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
@@ -1055,6 +1124,10 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_k.producer_tail(smem_pipe_write);
             pipeline_v.producer_tail(smem_pipe_write);
             if constexpr (Transpose_V) { pipeline_vt.producer_tail(smem_pipe_write); }
+            if constexpr (DequantKV) {
+                pipeline_k_fp8.producer_tail(smem_pipe_write_fp8);
+                pipeline_v_fp8.producer_tail(smem_pipe_write_fp8);
+            }
         }
     }
 

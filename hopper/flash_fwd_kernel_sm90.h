@@ -115,6 +115,10 @@ public:
             alignas(16) typename CollectiveMainloop::MainloopPipelineVt::SharedStorage pipeline_vt;
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_k_new;
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
+            // M5 B3-fast.2: fp8 staging pipelines (mbarriers only; the fp8 smem buffers live in
+            // TensorStorage). Tiny; present unconditionally (DequantKV=false => same as bf16 stages).
+            alignas(16) typename CollectiveMainloop::MainloopPipelineKFp8::SharedStorage pipeline_k_fp8;
+            alignas(16) typename CollectiveMainloop::MainloopPipelineVFp8::SharedStorage pipeline_v_fp8;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
@@ -190,7 +194,11 @@ public:
         using MainloopPipelineV = typename CollectiveMainloop::MainloopPipelineV;
         using MainloopPipelineVt = typename CollectiveMainloop::MainloopPipelineVt;
         using MainloopPipelineKVNew = typename CollectiveMainloop::MainloopPipelineKVNew;
+        using MainloopPipelineKFp8 = typename CollectiveMainloop::MainloopPipelineKFp8;
+        using MainloopPipelineVFp8 = typename CollectiveMainloop::MainloopPipelineVFp8;
         using PipelineState = typename CollectiveMainloop::PipelineState;
+        using PipelineStateFp8 = typename CollectiveMainloop::PipelineStateFp8;
+        static constexpr bool DequantKV = CollectiveMainloop::DequantKV;
         using PipelineParamsK = typename MainloopPipelineK::Params;
         using PipelineParamsV = typename MainloopPipelineV::Params;
         using PipelineParamsVt = typename MainloopPipelineVt::Params;
@@ -290,6 +298,17 @@ public:
             }
         }();
 
+        // M5 B3-fast.2: fp8 staging pipelines (cp.async). Producer = load WG (WG0); the same WG0 is
+        // also the consumer (the convert stage). Only WG0 touches them, so arv counts = NumProducerThreads.
+        typename MainloopPipelineKFp8::Params pipeline_params_fp8;
+        pipeline_params_fp8.role = warp_group_idx == 0
+            ? MainloopPipelineKFp8::ThreadCategory::Producer
+            : MainloopPipelineKFp8::ThreadCategory::Consumer;
+        pipeline_params_fp8.producer_arv_count = NumProducerThreads;
+        pipeline_params_fp8.consumer_arv_count = NumProducerThreads;
+        MainloopPipelineKFp8 pipeline_k_fp8(shared_storage.pipelines.pipeline_k_fp8, pipeline_params_fp8);
+        MainloopPipelineVFp8 pipeline_v_fp8(shared_storage.pipelines.pipeline_v_fp8, pipeline_params_fp8);
+
         PipelineParamsKVNew pipeline_params_kv_new;
         pipeline_params_kv_new.role = warp_group_idx == 0
             ? MainloopPipelineKVNew::ThreadCategory::Producer
@@ -332,6 +351,7 @@ public:
             // KV_new. Since the pipeline states are different, we have to manually sync to make
             // sure the two pipelines don't race when accessing smem_k and smem_v.
             PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
+            PipelineStateFp8 smem_pipe_write_fp8 = cutlass::make_producer_start_state<MainloopPipelineKFp8>();
             PipelineState smem_pipe_write_new = cutlass::make_producer_start_state<MainloopPipelineKVNew>();
             int work_idx = 0;
             int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
@@ -375,10 +395,12 @@ public:
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
                 // pipeline_vt won't be used if we don't need to transpose V.
-                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
+                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_k_fp8, pipeline_v_fp8,
+                                         smem_pipe_write, smem_pipe_write_fp8,
                                          shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
             }
-            mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
+            mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_k_fp8, pipeline_v_fp8,
+                               smem_pipe_write, smem_pipe_write_fp8, shared_storage, work_idx);
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
