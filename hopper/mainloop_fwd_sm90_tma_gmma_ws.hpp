@@ -868,8 +868,8 @@ struct CollectiveMainloopFwdSm90 {
                     // cp.async fp8 -> fp8 staging, wait, sync producer threads, convert -> bf16 smem_k,
                     // then a PLAIN producer_commit (not cpasync arrive) since the convert wrote smem.
                     paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_fp8_stage(smem_pipe_write.index()));
-                    cutlass::arch::cp_async_fence();
-                    cutlass::arch::cp_async_wait<0>();
+                    cute::cp_async_fence();
+                    flash::cp_async_wait<0>();
                     cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::ProducerConvert) /*id*/);
                     convert_K_stage(smem_pipe_write.index());
                     cutlass::arch::fence_view_async_shared();
@@ -892,8 +892,8 @@ struct CollectiveMainloopFwdSm90 {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
                 if constexpr (DequantKV) {
                     paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sV_fp8_stage(smem_pipe_write.index()));
-                    cutlass::arch::cp_async_fence();
-                    cutlass::arch::cp_async_wait<0>();
+                    cute::cp_async_fence();
+                    flash::cp_async_wait<0>();
                     cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::ProducerConvert) /*id*/);
                     convert_V_stage(smem_pipe_write.index());
                     cutlass::arch::fence_view_async_shared();
