@@ -120,8 +120,11 @@ def main():
     same = torch.allclose(rep0.float(), eager.float(), rtol=RTOL, atol=ATOL)
     reflects = torch.allclose(rep1.float(), eager2.float(), rtol=RTOL, atol=ATOL)
     delta = (rep0.float() - rep1.float()).abs().max().item()
-    print(f"  q={sq} splits={ns} | replay==eager:{same} reflects_input:{reflects} delta:{delta:.3e} changed:{delta>10*ATOL}")
-    if same and reflects and delta > 10 * ATOL:
+    # "changed" guards against a degenerate graph returning a frozen constant. Numerical
+    # noise is ~1e-4; any delta >> that on an input change proves genuine per-input recompute.
+    CHANGED_THR = 1e-2
+    print(f"  q={sq} splits={ns} | replay==eager:{same} reflects_input:{reflects} delta:{delta:.3e} changed:{delta>CHANGED_THR}")
+    if same and reflects and delta > CHANGED_THR:
         print("M4_CUDAGRAPH_PASS"); sys.exit(0)
     print("M4_CUDAGRAPH_FAIL"); sys.exit(4)
 
