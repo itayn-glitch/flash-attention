@@ -43,7 +43,7 @@ echo "== building (errors abort) =="
 
 test -f flash_attn_3_cuda*.so || { echo "BUILD FAILED: no .so produced"; exit 1; }
 echo "== built module =="
-"$PY" -c "import flash_attn_3_cuda as m; print('import OK:', m.__file__)"
+"$PY" -c "import torch; import flash_attn_3_cuda as m; print('import OK:', m.__file__)"
 
 echo "== M1 gate (correctness + perf) =="
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
