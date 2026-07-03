@@ -45,7 +45,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr bool MmaPV_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
     static constexpr bool IntraWGOverlap = std::get<3>(kBlockMN_RS_IntraWGOverlap);
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
-    static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+    // Square head-512 (kHeadDim>256): 2 stages of bf16 K+V (2*64*512*2B each) blow past
+    // H100's 227KB smem, so single-buffer for now. This is the OQ2 bf16 limit; fp8 KV (M5)
+    // or smaller kBlockN is what unlocks deeper pipelining. Tuned empirically at M1.
+    static constexpr int kStages = Arch >= 90 ? (kHeadDim > 256 ? 1 : 2) : std::get<3>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
