@@ -73,6 +73,13 @@ def main():
     h, hk, d, page = args.nheads, args.nheads_k, args.headdim, args.page
     scale = 1.0 / (d ** 0.5)
     print(f"module: {fa.flash_attn_3_cuda.__file__}  page={page}")
+    # FINDING (flash_api.cpp use_pagedkv_tma, line 450): paged-TMA needs
+    # page%kBlockN==0 AND seqlen_q*(h/h_k) > kBlockM. For Gemma4 decode/verify
+    # (q<=8, GQA x8 => packed-M<=64) with kBlockM=64, the 2nd condition is never
+    # satisfied, so page=64 STILL runs the cp.async paged path (FA3 itself found TMA
+    # slower for small-M: "when seqlen_q <= kBlockM ... using TMA is slower"). So this
+    # test validates graph-capturability on the cp.async paged path -- which is prod's
+    # path anyway. Paged-TMA only matters for large-q prefill; OQ1 => keep page=16.
 
     print(f"== correctness (page={page} paged-TMA, fp32 block-table oracle, ragged) ==")
     ok_all = True
