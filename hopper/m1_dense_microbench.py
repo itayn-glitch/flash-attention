@@ -37,7 +37,7 @@ def main():
     scale = 1.0 / (d ** 0.5)
 
     try:
-        out = fa.flash_attn_func(q, k, v, softmax_scale=scale, causal=True, num_splits=1)
+        out = fa.flash_attn_func(q, k, v, softmax_scale=scale, causal=True, num_splits=1, pack_gqa=False)
         if isinstance(out, tuple):
             out = out[0]
         torch.cuda.synchronize()
@@ -58,12 +58,12 @@ def main():
     total_bytes = kv_bytes + q_bytes + o_bytes
 
     for _ in range(args.warmup):
-        fa.flash_attn_func(q, k, v, softmax_scale=scale, causal=True, num_splits=1)
+        fa.flash_attn_func(q, k, v, softmax_scale=scale, causal=True, num_splits=1, pack_gqa=False)
     torch.cuda.synchronize()
     start, end = torch.cuda.Event(True), torch.cuda.Event(True)
     start.record()
     for _ in range(args.iters):
-        fa.flash_attn_func(q, k, v, softmax_scale=scale, causal=True, num_splits=1)
+        fa.flash_attn_func(q, k, v, softmax_scale=scale, causal=True, num_splits=1, pack_gqa=False)
     end.record()
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / args.iters
