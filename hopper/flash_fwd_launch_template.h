@@ -185,10 +185,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
-    // int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
-    // int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
-    // int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
-    // printf("smem_size = %d, q = %d, k = %d, v = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v);
+    // M5 P2 gate: report exact dynamic smem for this instantiation on demand.
+    if (getenv("FLASH_PRINT_SMEM") != nullptr) {
+        int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
+        int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
+        int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
+        printf("[FLASH_SMEM] total=%d B (%.1f KB, cap 227KB)  q=%d k=%d v=%d  hdim=%d\n",
+               smem_size, smem_size / 1024.0, smem_size_q, smem_size_k, smem_size_v,
+               (int)CollectiveMainloop::kHeadDim);
+    }
     // Get the ptr to kernel function.
     if constexpr (size(ClusterShape{}) > 1) {
         void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;

@@ -175,6 +175,21 @@ struct CollectiveMainloopFwdSm90 {
         SmemLayoutAtomVCpAsync{},
         make_shape(shape<1>(TileShape_MNK{}), Int<kHeadDimV>{}, Int<kStages>{})));
 
+    // M5 dequant-on-load (Path B): fp8 STAGING layouts, typed by ElementKV (1 byte).
+    // The cp.async producer gathers fp8 KV into these, then a vectorized convert upcasts
+    // into the bf16 smem_k/smem_v the wgmma consumes (consumer unchanged). Swizzle atom
+    // is selected for ElementKV (fp8) so cp.async stores land bank-conflict-free.
+    using SmemLayoutAtomKFp8 = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementKV,
+        decltype(cute::get<1>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
+    using SmemLayoutKFp8 = decltype(tile_to_shape(
+        SmemLayoutAtomKFp8{},
+        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
+    using SmemLayoutAtomVFp8 = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementKV,
+        decltype(cute::get<1>(TileShape_MNK{})), Int<kHeadDimV>>());
+    using SmemLayoutVFp8 = decltype(tile_to_shape(
+        SmemLayoutAtomVFp8{},
+        make_shape(shape<1>(TileShape_MNK{}), Int<kHeadDimV>{}, Int<kStages>{})));
+
     using SmemLayoutAtomP = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
     using SmemLayoutP = decltype(tile_to_shape(SmemLayoutAtomP{}, select<0, 1>(TileShape_MNK{})));
@@ -320,6 +335,10 @@ struct CollectiveMainloopFwdSm90 {
     using SmemP_t = std::conditional_t<MmaPV_is_RS, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutP>, SmemAlignmentP>>;
     using SmemScale_t = std::conditional_t<!LargeHeadDimV, cute::array<float, 0>, cute::array_aligned<float, cute::cosize_v<SmemLayoutScale>, 128>>;
     using SmemQv_t = std::conditional_t<!HasQv, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutQv>, SmemAlignmentQv>>;
+    // M5 dequant fp8 staging buffers: real size only when DequantKV, else truly 0-byte
+    // (same zero-size idiom as SmemP_t/SmemQv_t so the bf16 build is byte-identical).
+    using SmemKFp8_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutKFp8>, 128>, cute::array<ElementKV, 0>>;
+    using SmemVFp8_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutVFp8>, 128>, cute::array<ElementKV, 0>>;
     // Sometimes even with SmemP_t = cute::array<Element, 0>, putting it in the TensorStorage struct causes
     // smem size to go from 227KB to 228KB and we get "invalid argument".
 
@@ -347,6 +366,8 @@ struct CollectiveMainloopFwdSm90 {
         SmemP_t smem_p;
         SmemScale_t smem_scale;
         cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
+        SmemKFp8_t smem_k_fp8;  // M5 dequant staging (0-byte unless DequantKV)
+        SmemVFp8_t smem_v_fp8;
     };
 
     using TensorStorageNoTranspose = std::conditional_t<
