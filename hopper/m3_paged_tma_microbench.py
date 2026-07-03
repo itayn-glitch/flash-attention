@@ -94,8 +94,12 @@ def main():
     print("M3_CORRECTNESS_PASS")
 
     print("== cudagraph capture + replay (C1/C2 precursor) ==")
-    b, kv = args.batch, args.seqlen
+    # Use unit-scale q/k/v + short KV so scores are large -> softmax is sharp -> output is
+    # O(1) (a distinct V row), NOT the ~1e-3 that a long-KV average of tiny V gives. Only
+    # then is "did the output change when the input changed" a meaningful, above-noise test.
+    b, kv = 8, 256
     q, kc, vc, pt, cs = make_paged(b, kv, h, hk, d, page, ragged=False, seed=1)
+    q.copy_(torch.randn_like(q)); kc.copy_(torch.randn_like(kc)); vc.copy_(torch.randn_like(vc))
     eager = run_kernel(fa, q, kc, vc, pt, cs, scale).clone()
     torch.cuda.synchronize()
     s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
@@ -120,11 +124,15 @@ def main():
     rep1 = captured.clone()
     eager_scaled = run_kernel(fa, q, kc, vc, pt, cs, scale)  # eager on mutated q
     torch.cuda.synchronize()
+    out_scale = eager.float().abs().mean().item()
     same_as_eager = torch.allclose(rep0.float(), eager.float(), rtol=RTOL, atol=ATOL)
     reflects_input = torch.allclose(rep1.float(), eager_scaled.float(), rtol=RTOL, atol=ATOL)
-    changed = not torch.allclose(rep0.float(), rep1.float(), rtol=RTOL, atol=ATOL)
-    print(f"  replay==eager: {same_as_eager} | reflects mutated input: {reflects_input} | "
-          f"output changed on input change: {changed}")
+    # Magnitude-aware: the replayed output must move by >> tolerance when the input changes.
+    delta = (rep0.float() - rep1.float()).abs().max().item()
+    changed = delta > 10 * ATOL
+    print(f"  out|.|mean={out_scale:.3e} | replay==eager: {same_as_eager} | "
+          f"reflects mutated input: {reflects_input} | delta(rep0,rep1)={delta:.3e} "
+          f"changed(>{10*ATOL:.2f}): {changed}")
     if same_as_eager and reflects_input and changed:
         print("M3_CUDAGRAPH_PASS"); sys.exit(0)
     print("M3_CUDAGRAPH_FAIL"); sys.exit(4)
