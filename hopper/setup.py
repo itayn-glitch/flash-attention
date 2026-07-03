@@ -61,7 +61,10 @@ DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
-DISABLE_HDIM512 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM512", "FALSE") == "TRUE"  # square head-512 (Gemma4 global)
+# Square head-512 (Gemma4 global). DEFAULT-DISABLED: only the base bf16 512 fwd shape is
+# M1-validated; the split/paged/softcap 512 variants are unvalidated until M2+. Opt in with
+# FLASH_ATTENTION_DISABLE_HDIM512=FALSE (build_m1.sh does this).
+DISABLE_HDIM512 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM512", "TRUE") == "TRUE"
 DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
