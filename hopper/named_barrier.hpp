@@ -56,6 +56,7 @@ enum class FwdNamedBarriers {
     QueryRotated = 5,
     PFull = 6,
     PEmpty = 7,
+    ProducerConvert = 8,  // M5 dequant: sync producer threads between fp8 load and convert
 };
 
 enum class BwdNamedBarriers {

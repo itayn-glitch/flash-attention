@@ -704,6 +704,15 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
 
+        // M5 dequant: per-(batch,kv-head) descales, folded directly into the fp8->bf16
+        // convert (correctness-first; O = P·(fp8_v·v_descale) and scores = (fp8_k·k_descale)·Q
+        // are both exact, so no softmax/finalize edits needed). q stays bf16 (q_descale=1).
+        float k_descale_val = 1.0f, v_descale_val = 1.0f;
+        if constexpr (DequantKV) {
+            if (params.ptr_k_descale != nullptr) { k_descale_val = params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)]; }
+            if (params.ptr_v_descale != nullptr) { v_descale_val = params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)]; }
+        }
+
         // Prepare the TMA loads
         uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
@@ -756,11 +765,15 @@ struct CollectiveMainloopFwdSm90 {
         // This is used to index into the batch dimension of mK and mV
         int const bidb_kv_idx = !is_varlen_k && !params.ptr_pagetable ? bidb_kv : 0;
 
-        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, Element, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/>;
+        // M5 dequant: the paged manager gathers the KV cache in its STORAGE dtype
+        // (ElementKV = fp8 when DequantKV) into the fp8 staging smem; the producer then
+        // upcasts to bf16. When !DequantKV, PagedKVElement == Element (unchanged).
+        using PagedKVElement = std::conditional_t<DequantKV, ElementKV, Element>;
+        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, PagedKVElement, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/>;
         PagedKVManager_t paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
-            params.ptr_K, params.shape_K, params.stride_K,
-            params.ptr_V, params.headdim_v, params.stride_V,
+            reinterpret_cast<PagedKVElement*>(params.ptr_K), params.shape_K, params.stride_K,
+            reinterpret_cast<PagedKVElement*>(params.ptr_V), params.headdim_v, params.stride_V,
             params.page_size_divmod, params.blockN_per_page_size_divmod,
             bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k - n_offset, seqlen_info.leftpad_k + n_offset, bidb_kv_idx
         );
@@ -812,6 +825,37 @@ struct CollectiveMainloopFwdSm90 {
             }
         }
 
+        // M5 dequant (B3-simple, correctness-first): upcast one fp8 staging stage -> bf16
+        // smem, descale folded per-element. Element-wise over the logical domain (swizzle-safe:
+        // linear index maps through each tensor's own layout). Vectorize (fp8x4->bf16x2) later.
+        // All fp8-staging tensors are constructed INSIDE these gated branches so the bf16
+        // build (DequantKV=false) never instantiates a view over the 0-size staging array.
+        auto convert_K_stage = [&] (int stage) {
+            if constexpr (DequantKV) {
+                Tensor sKf = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k_fp8.data()), SmemLayoutKFp8{}))(_, _, stage);
+                Tensor sKb = sK_pi(_, _, stage);
+                for (int i = thread_idx; i < size(sKf); i += NumProducerThreads) {
+                    sKb(i) = static_cast<Element>(float(sKf(i)) * k_descale_val);
+                }
+            }
+        };
+        auto convert_V_stage = [&] (int stage) {
+            if constexpr (DequantKV) {
+                Tensor sVf = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_fp8.data()), SmemLayoutVFp8{}))(_, _, stage);
+                Tensor sVb = sVcpasync(_, _, stage);
+                for (int i = thread_idx; i < size(sVf); i += NumProducerThreads) {
+                    sVb(i) = static_cast<Element>(float(sVf(i)) * v_descale_val);
+                }
+            }
+        };
+        // fp8 staging targets for the paged cp.async loads (also gated).
+        auto sK_fp8_stage = [&] (int stage) {
+            return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k_fp8.data()), SmemLayoutKFp8{}))(_, _, stage);
+        };
+        auto sV_fp8_stage = [&] (int stage) {
+            return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_fp8.data()), SmemLayoutVFp8{}))(_, _, stage);
+        };
+
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             pipeline_k.producer_acquire(smem_pipe_write);
             if constexpr (!PagedKVNonTMA) {
@@ -820,8 +864,20 @@ struct CollectiveMainloopFwdSm90 {
                     tKgK_TMA(_, n_block_idx, bidb_kv_idx), tKsK_TMA(_, smem_pipe_write.index()));
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
-                paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_pi(_, _, smem_pipe_write.index()));
-                pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+                if constexpr (DequantKV) {
+                    // cp.async fp8 -> fp8 staging, wait, sync producer threads, convert -> bf16 smem_k,
+                    // then a PLAIN producer_commit (not cpasync arrive) since the convert wrote smem.
+                    paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_fp8_stage(smem_pipe_write.index()));
+                    cutlass::arch::cp_async_fence();
+                    cutlass::arch::cp_async_wait<0>();
+                    cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::ProducerConvert) /*id*/);
+                    convert_K_stage(smem_pipe_write.index());
+                    cutlass::arch::fence_view_async_shared();
+                    pipeline_k.producer_commit(smem_pipe_write);
+                } else {
+                    paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_pi(_, _, smem_pipe_write.index()));
+                    pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+                }
             }
         };
 
@@ -834,8 +890,18 @@ struct CollectiveMainloopFwdSm90 {
                     tVgVt_TMA(_, n_block_idx, bidb_kv_idx), tVsVt_TMA(_, smem_pipe_write.index()));
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
-                paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sVcpasync(_, _, smem_pipe_write.index()));
-                pipeline_v_load.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+                if constexpr (DequantKV) {
+                    paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sV_fp8_stage(smem_pipe_write.index()));
+                    cutlass::arch::cp_async_fence();
+                    cutlass::arch::cp_async_wait<0>();
+                    cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::ProducerConvert) /*id*/);
+                    convert_V_stage(smem_pipe_write.index());
+                    cutlass::arch::fence_view_async_shared();
+                    pipeline_v_load.producer_commit(smem_pipe_write);
+                } else {
+                    paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sVcpasync(_, _, smem_pipe_write.index()));
+                    pipeline_v_load.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+                }
             }
         };
 
