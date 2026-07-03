@@ -322,6 +322,13 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 #ifndef FLASHATTENTION_DISABLE_HDIM256
                                 if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
+                                #ifndef FLASHATTENTION_DISABLE_HDIM512
+                                // Square head-512 (Gemma4 global). Sm90-only (LargeHeadDimV machinery);
+                                // if constexpr guards the sm80 path from instantiating a 512 symbol.
+                                if constexpr (Arch == 90) {
+                                    if (params.d <= 512) { return run_mha_fwd_<90, cutlass::bfloat16_t, 512, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+                                }
+                                #endif
                             } else {
                                 #ifndef FLASHATTENTION_DISABLE_FP16
                                 #ifndef FLASHATTENTION_DISABLE_HDIM64
@@ -503,6 +510,9 @@ inline int get_num_splits(Flash_fwd_params const& params) {
 }
 
 inline int get_max_headdim() {
+    #ifndef FLASHATTENTION_DISABLE_HDIM512
+    return 512;
+    #endif
     #ifndef FLASHATTENTION_DISABLE_HDIM256
     return 256;
     #endif
@@ -536,6 +546,9 @@ inline int round_up_headdim(int head_size) {
     #endif
     #ifndef FLASHATTENTION_DISABLE_HDIM256
     if (head_size <= 256) { return 256; }
+    #endif
+    #ifndef FLASHATTENTION_DISABLE_HDIM512
+    if (head_size <= 512) { return 512; }
     #endif
     return 256;
 }

@@ -141,6 +141,12 @@ def get_all_kernels() -> List[Kernel]:
         if sm == 90 and head_dim == 64 and dtype in ["bf16", "fp16"]:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=256, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
+        # Square head-512 (Gemma4 global attention): QK-512 instantiation absent from stock FA3.
+        # Piggyback the hdim==256 iteration so we emit one 512/512 kernel per feature combo.
+        # bf16 only for M1; fp8 (e4m3) 512 is deferred to M5 (needs the fp8 tile_size branch,
+        # else it hits the kBlockM=128 fallback and violates the LargeHeadDimV kBlockM<=64 assert).
+        if sm == 90 and head_dim == 256 and dtype == "bf16":
+            yield Kernel(sm=sm, dtype=dtype, head_dim=512, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
     for dtype, head_dim, softcap, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SOFTCAP, SM):
         yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=False, paged_kv=False, softcap=softcap, packgqa=False, direction="bwd")
 
