@@ -239,7 +239,14 @@ public:
             pipeline_params_vt.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
             if constexpr (LargeHeadDimV) { pipeline_params_vt.num_consumers = NumMmaThreads; }
         } else {
-            if constexpr (LargeHeadDimV) { pipeline_params_vt.consumer_arv_count = NumMmaThreads; }
+            // Square large-headdim-V (kHeadDim == kHeadDimV > 256, e.g. Gemma4 head-512):
+            // Vt shares K's TMA pipeline params (SameHeadDim => same transaction bytes as K),
+            // which expose num_consumers, not the cp.async-only consumer_arv_count. Select the
+            // member matching the params type. (Stock FA3 only had kHeadDim < kHeadDimV here.)
+            if constexpr (LargeHeadDimV) {
+                if constexpr (Use_TMA_KV) { pipeline_params_vt.num_consumers = NumMmaThreads; }
+                else { pipeline_params_vt.consumer_arv_count = NumMmaThreads; }
+            }
         }
 
         MainloopPipelineK pipeline_k = [&] {
