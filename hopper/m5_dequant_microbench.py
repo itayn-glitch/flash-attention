@@ -128,6 +128,23 @@ def main():
     ok &= check(fa, "b=16 kv=4096 q=5 split=16 causal RAGGED", 16, 4096, h, hk, d, 5, scale, 16, True, ragged=True)
 
     print("M5_DEQUANT_CORRECTNESS_" + ("PASS" if ok else "FAIL"))
+
+    # DIAGNOSTIC latency (NOT a final claim): current config is vectorized-convert / kStages=1
+    # (no load<->convert overlap yet). bf16 M1 baseline @ b=32 s9216 = ~792us / 3047 GB/s / 91%.
+    print("== diagnostic perf (vectorized convert, kStages=1) b=32 s9216 ==")
+    b, kv = 32, 9216
+    q, kc, vc, pt, cs, ks, vs = make_paged(b, kv, h, hk, d, 1, False, 0)
+    for _ in range(20): run_kernel(fa, q, kc, vc, pt, cs, scale, ks, vs, 1, True)
+    torch.cuda.synchronize()
+    st, en = torch.cuda.Event(True), torch.cuda.Event(True)
+    st.record()
+    for _ in range(50): run_kernel(fa, q, kc, vc, pt, cs, scale, ks, vs, 1, True)
+    en.record(); torch.cuda.synchronize()
+    ms = st.elapsed_time(en) / 50
+    kv_bytes = 2 * b * kv * hk * d * 1          # fp8 = 1 byte
+    bw = (kv_bytes + 2 * b * h * d * 2) / (ms * 1e-3) / 1e9
+    print(f"  fp8-dequant: {ms*1e3:.1f} us/iter | fp8 KV={kv_bytes/1e6:.0f}MB | eff BW={bw:.0f} GB/s "
+          f"(bf16 M1 baseline 792us; fp8 reads HALF the KV bytes)")
     sys.exit(0 if ok else 3)
 
 
