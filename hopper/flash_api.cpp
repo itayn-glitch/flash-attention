@@ -100,6 +100,11 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.is_bf16 = q.dtype() == torch::kBFloat16;
     params.is_e4m3 = q.dtype() == torch::kFloat8_e4m3fn;
+    // M5 dequant-on-load: bf16 query + fp8 KV cache. This is the storage-dtype contract —
+    // k/v strides below come from these (fp8) tensors in fp8 element units, so the kernel's
+    // reinterpret_cast<ElementKV*> addresses correct memory. HARD GATE (used in dispatch):
+    // the DequantKV route is taken ONLY when kv_is_fp8 && !is_e4m3 (i.e. q is NOT fp8).
+    params.kv_is_fp8 = (k.dtype() == torch::kFloat8_e4m3fn) && (q.dtype() != torch::kFloat8_e4m3fn);
 
     // Set the pointers and strides.
     params.q_ptr = q.data_ptr();
@@ -326,7 +331,17 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 // Square head-512 (Gemma4 global). Sm90-only (LargeHeadDimV machinery);
                                 // if constexpr guards the sm80 path from instantiating a 512 symbol.
                                 if constexpr (Arch == 90) {
-                                    if (params.d <= 512) { return run_mha_fwd_<90, cutlass::bfloat16_t, 512, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+                                    if (params.d <= 512) {
+                                        #ifndef FLASHATTENTION_DISABLE_DEQUANTKV
+                                        // M5 dequant-on-load: bf16 q + fp8 KV cache -> ElementKV=e4m3 instantiation.
+                                        // HARD GATE: only when the KV cache is actually fp8 (contract enforced in
+                                        // set_params_fwd). PagedKVNonTMA (cp.async) is required for the fp8 gather.
+                                        if (params.kv_is_fp8 && PagedKVNonTMA) {
+                                            return run_mha_fwd_<90, cutlass::bfloat16_t, 512, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA, cutlass::float_e4m3_t>(params, stream);
+                                        }
+                                        #endif
+                                        return run_mha_fwd_<90, cutlass::bfloat16_t, 512, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                    }
                                 }
                                 #endif
                             } else {

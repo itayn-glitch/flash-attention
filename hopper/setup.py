@@ -65,6 +65,9 @@ DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE
 # M1-validated; the split/paged/softcap 512 variants are unvalidated until M2+. Opt in with
 # FLASH_ATTENTION_DISABLE_HDIM512=FALSE (build_m1.sh does this).
 DISABLE_HDIM512 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM512", "TRUE") == "TRUE"
+# M5 dequant-on-load (fp8 KV storage -> bf16 compute) head-512. DEFAULT-DISABLED (opt-in,
+# like HDIM512); build_m5.sh sets FALSE. Requires HDIM512 enabled + PagedKV (cp.async path).
+DISABLE_DEQUANTKV = os.getenv("FLASH_ATTENTION_DISABLE_DEQUANTKV", "TRUE") == "TRUE"
 DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
@@ -503,6 +506,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_HDIM192"] if DISABLE_HDIM192 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM512"] if DISABLE_HDIM512 else [])
+        + (["-DFLASHATTENTION_DISABLE_DEQUANTKV"] if DISABLE_DEQUANTKV else [])
         + (["-DFLASHATTENTION_DISABLE_SM8x"] if DISABLE_SM8x else [])
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF64"] if DISABLE_HDIMDIFF64 else [])
@@ -569,6 +573,12 @@ if not SKIP_CUDA_BUILD:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim512_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                              for dtype, split, paged, softcap, packgqa in itertools.product(["bf16"], SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
                              if not (packgqa and (paged or split)) and (not PACKGQA_ONLY or packgqa or paged or split)]
+        if not DISABLE_DEQUANTKV and not DISABLE_PAGEDKV:
+            # M5 dequant-on-load 512 (fp8 KV storage). Emitted only for paged (cp.async) — see
+            # generate_kernels, which filters raw packgqa=True when paged, so no _packgqa suffix
+            # (the instantiation's actual PackGQA arg is still true via packgqa|paged|split).
+            sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim512_bf16_dequantkv_paged{split}{softcap}_sm90.cu"
+                                 for split, softcap in itertools.product(SPLIT, SOFTCAP)]
     if not DISABLE_HDIMDIFF64:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                              for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)

@@ -142,6 +142,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_bf16;
     bool is_fp32;
     bool is_e4m3;
+    bool kv_is_fp8;  // M5 dequant-on-load: KV cache stored as fp8(e4m3) while q is bf16
     bool is_causal;
     bool is_local;
 

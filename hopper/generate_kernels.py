@@ -42,6 +42,16 @@ template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {
 #endif
 """
 
+# M5 dequant-on-load: bf16 compute (T) + fp8 (e4m3) KV STORAGE. Trailing ElementKV param.
+KERNEL_IMPL_TEMPLATE_FWD_SM90_DEQUANT = """#include "flash_fwd_launch_template.h"
+
+#ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
+#ifndef FLASHATTENTION_DISABLE_DEQUANTKV
+template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}, cutlass::float_e4m3_t>(Flash_fwd_params &params, cudaStream_t stream);
+#endif
+#endif
+"""
+
 KERNEL_IMPL_TEMPLATE_FWD_SM8x = """#include "flash_fwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_SM8x
@@ -91,6 +101,7 @@ class Kernel:
     softcap: bool
     packgqa: bool
     direction: str
+    dequant: bool = False  # M5: fp8 KV storage + bf16 compute (ElementKV=e4m3)
 
     @property
     def template(self) -> str:
@@ -98,7 +109,8 @@ class Kernel:
             if self.sm == 90:
                 # Always enable PackGQA for PagedKV or Split to reduce compilation
                 packgqa = self.packgqa or self.paged_kv or self.split
-                return KERNEL_IMPL_TEMPLATE_FWD_SM90.format(
+                tmpl = KERNEL_IMPL_TEMPLATE_FWD_SM90_DEQUANT if self.dequant else KERNEL_IMPL_TEMPLATE_FWD_SM90
+                return tmpl.format(
                     ARCH=str(self.sm), DTYPE=DTYPE_MAP[self.dtype],
                     HEAD_DIM=self.head_dim, HEAD_DIM_V=self.head_dim_v,
                     SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
@@ -125,7 +137,7 @@ class Kernel:
 
     @property
     def filename(self) -> str:
-        return f"flash_{self.direction}_hdim{self.head_dim}{f'_{self.head_dim_v}' if self.head_dim_v != self.head_dim else ''}_{self.dtype}{'_paged' if self.paged_kv else ''}{'_split' if self.split else ''}{'_softcap' if self.softcap else ''}{'_packgqa' if self.packgqa else ''}_sm{self.sm}.cu"
+        return f"flash_{self.direction}_hdim{self.head_dim}{f'_{self.head_dim_v}' if self.head_dim_v != self.head_dim else ''}_{self.dtype}{'_dequantkv' if self.dequant else ''}{'_paged' if self.paged_kv else ''}{'_split' if self.split else ''}{'_softcap' if self.softcap else ''}{'_packgqa' if self.packgqa else ''}_sm{self.sm}.cu"
 
 
 def get_all_kernels() -> List[Kernel]:
@@ -148,6 +160,10 @@ def get_all_kernels() -> List[Kernel]:
         # The fp8 head-512 path is instead "dequant-on-load -> bf16 MMA" (M5 option 2).
         if sm == 90 and head_dim == 256 and dtype == "bf16":
             yield Kernel(sm=sm, dtype=dtype, head_dim=512, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
+            # M5 dequant-on-load variant (fp8 KV storage -> bf16 compute). Requires the
+            # cp.async paged path (PagedKVNonTMA), so emit only for paged_kv=True.
+            if paged_kv:
+                yield Kernel(sm=sm, dtype=dtype, head_dim=512, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd", dequant=True)
     for dtype, head_dim, softcap, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SOFTCAP, SM):
         yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=False, paged_kv=False, softcap=softcap, packgqa=False, direction="bwd")
 
