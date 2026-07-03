@@ -429,7 +429,11 @@ if not SKIP_CUDA_BUILD:
     # ptxas 12.8 gives the best perf currently
     # We want to use the nvcc front end from 12.6 however, since if we use nvcc 12.8
     # Cutlass 3.8 will expect the new data types in cuda.h from CTK 12.8, which we don't have.
-    if bare_metal_version != Version("12.8"):
+    # FLASH_ATTENTION_USE_SYSTEM_CTK=1 uses the system CUDA toolkit (CUDA_HOME) as-is
+    # instead of downloading the pinned nvcc 12.6 / ptxas 12.8. Needed when torch is built
+    # against a newer CTK (e.g. cu130): the pinned 12.x nvcc would trip torch's CUDA
+    # version check, so we compile with the matching system toolkit.
+    if bare_metal_version != Version("12.8") and not check_env_flag("FLASH_ATTENTION_USE_SYSTEM_CTK", ""):
         download_and_copy(
             name="nvcc",
             src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin",
