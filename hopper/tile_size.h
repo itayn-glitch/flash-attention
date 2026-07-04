@@ -16,7 +16,7 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             // LargeHeadDimV (kHeadDimV > 256) forces kBlockM <= 64 and MmaPV_is_RS = false
             // (mainloop static_asserts). OQ2 de-risk: kBlockN=64 pipelines 2-3 stages within
             // H100's 228 KB/SM (fp8 KV is the enabler). Conservative start; tuned at M1.
-            return {64, 64, false, false};
+            return {64, 64, false, true};
         }
         if (headdim <= 64) {
             // return {same_hdim ? 192 : 64, same_hdim ? 128 : 64, same_hdim, same_hdim};
