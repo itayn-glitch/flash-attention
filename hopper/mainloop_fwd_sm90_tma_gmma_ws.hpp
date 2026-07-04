@@ -45,10 +45,10 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool DequantKV = !cute::is_same_v<ElementKV, Element_>;  // fp8 storage, bf16 compute
     // M5 B3-fast.2 pipeline (DequantKV, kBlockN=16): load -> convert -> MMA, each double-buffered.
     //   - bf16 target pipeline: kStages=2 (set in launch template) so convert(n+1) overlaps MMA(n).
-    //   - fp8 STAGING pipeline: kStagesFp8=4 so the cp.async load runs 3 blocks ahead of the convert
+    //   - fp8 STAGING pipeline: kStagesFp8=3 so the cp.async load runs 2 blocks ahead of the convert
     //     (hides DRAM latency). FREE up to 4: the epilogue-smem_o union overlays the staging, so extra
     //     staging fills the previously-wasted O-alignment padding at zero total-smem cost (stays 196KB).
-    static constexpr int kStagesFp8 = DequantKV ? 4 : kStages;
+    static constexpr int kStagesFp8 = DequantKV ? 3 : kStages;
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
