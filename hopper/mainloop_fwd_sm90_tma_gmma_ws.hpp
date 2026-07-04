@@ -871,8 +871,9 @@ struct CollectiveMainloopFwdSm90 {
             Tensor rb = make_fragment_like(tsb);
             cute::copy(tcf, tsf, rf);
             CUTLASS_PRAGMA_UNROLL
-            // B4-PROBE (perf-only, numerically INVALID -- REVERT before correctness): drop the FP32
-            // descale mult to test whether producer-convert length feeds the 32% barrier stall.
+            // B4 reversal: PURE fp8->bf16 convert (fp8->bf16 is lossless: bf16 mantissa 8b >= fp8 3b).
+            // descale is applied in the CONSUMER math instead (k_descale into pre-softmax scores,
+            // v_descale into finalize) -- off the producer critical path (measured -6% barrier stall).
             for (int j = 0; j < size(rf); ++j) { rb(j) = static_cast<Element>(float(rf(j))); }
             (void)descale;
             cute::copy(tcb, rb, tsb);
@@ -1037,8 +1038,8 @@ struct CollectiveMainloopFwdSm90 {
 
         if constexpr (DequantKV) {
             // ---- B3-fast.2: software-pipelined fp8 dequant load ----
-            // Load block n's fp8 K & V (into one fp8 staging stage, kStagesFp8) via async cp.async,
-            // then convert the PREVIOUS block fp8->bf16 (into the kStages=1 bf16 pipeline the MMA reads).
+            // Load block n's fp8 K & V (into fp8 staging, kStagesFp8=2) via async cp.async, then convert
+            // the PREVIOUS block fp8->bf16 into the bf16 pipeline (kStages=2, so convert(n+1) overlaps MMA(n)).
             // The convert runs one block behind the load, so block n's cp.async stays in flight while
             // block n+1 is converted+consumed -> DRAM load overlaps convert+MMA (the missing overlap).
             if (should_load_KV) {
@@ -1319,10 +1320,22 @@ struct CollectiveMainloopFwdSm90 {
             float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)];
             softcap_val *= q_descale * k_descale;
         }
+        // M5 B4 reversal: for DequantKV the fp8->bf16 convert is pure (no descale), so k_descale is
+        // folded into the raw scores here (exact: score = k_descale * (Q . fp8_K)). q stays bf16.
+        // With softcap it folds into softcap_val (like Is_FP8); without softcap, multiply scores below.
+        float k_descale_dq = 1.0f;
+        if constexpr (DequantKV) {
+            k_descale_dq = params.ptr_k_descale == nullptr ? 1.0f : params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)];
+            if constexpr (Has_softcap) { softcap_val *= k_descale_dq; }
+        }
         // Softcapping needs to happen before masking since if we apply after masking, softcapping
         // can turn -inf to e.g. -50.0, which can affect the attention softmax.
         auto scoremod_premask_fn = [&](auto& tSrS) {
             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
+            else if constexpr (DequantKV) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < size(tSrS); ++i) { tSrS(i) *= k_descale_dq; }
+            }
         };
 
         auto write_P_to_smem = [&](auto& tOrP) {
@@ -1534,7 +1547,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
             if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
             flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-            float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
+            float const v_descale = !(Is_FP8 || DequantKV) || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             // cute::copy(softmax.finalize(v_descale), scores_scale);
             finalize_dispatch(scores_scale, v_descale);
             if constexpr (LargeHeadDimV) {
@@ -1637,7 +1650,7 @@ struct CollectiveMainloopFwdSm90 {
             warp_scheduler_barrier_arrive();
             // Tell producers that smem_q is ready
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
-            float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
+            float const v_descale = !(Is_FP8 || DequantKV) || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             // Tensor scores_scale = softmax.finalize(v_descale);
             Tensor scores_scale = make_tensor_like(softmax.row_max);
             finalize_dispatch(scores_scale, v_descale);

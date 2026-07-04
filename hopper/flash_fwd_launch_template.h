@@ -45,11 +45,12 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, Use_one_mma_wg);
     static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_sm8x(Arch == 86 || Arch == 89, kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKVNonTMA, Varlen && Split, Has_softcap, AppendKV);
     static constexpr int kBlockM = Arch >= 90 ? std::get<0>(kBlockMN_RS_IntraWGOverlap) : std::get<0>(kBlockMN_kNWarps_Stages_RS);
-    // M5: the dequant path adds fp8 STAGING smem, double-buffered (kStagesFp8=2) for load/convert
-    // overlap (BOTH K and V must be 2-stage or the shared producer WG stalls on DRAM -- measured:
-    // asymmetric K2/V1 collapsed to 8726us). Full 2-stage K+V at kBlockN=32 = 64KB staging, which
-    // fits 227KB because the kernel overlays the epilogue smem_o onto the staging region (both
-    // transient, never simultaneously live) -> ~196KB. bf16/fp8-native paths keep their tuned kBlockN.
+    // M5 dequant: kBlockN=16 is the ACTIVE/best config (measured 1053-1124us). kBlockN=32 also fits
+    // (the kernel overlays epilogue smem_o onto the fp8 staging via the union -> ~199KB) and is CORRECT,
+    // but measured SLOWER (1935us): with bf16 kStages=1 it was barrier-bound and bigger tiles lengthen
+    // the convert<->MMA ping-pong. kBlockN=16 keeps that gap short. fp8 staging is double-buffered
+    // (kStagesFp8=2); BOTH K and V must be 2-stage or the shared producer WG stalls on DRAM (asymmetric
+    // K2/V1 collapsed to 8726us). bf16/fp8-native paths keep their tuned kBlockN.
     static constexpr int kBlockN = DequantKV ? 16 : (Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS));
     static constexpr bool MmaPV_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
     static constexpr bool IntraWGOverlap = std::get<3>(kBlockMN_RS_IntraWGOverlap);
