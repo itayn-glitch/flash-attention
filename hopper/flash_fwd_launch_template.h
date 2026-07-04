@@ -50,7 +50,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // asymmetric K2/V1 collapsed to 8726us). Full 2-stage K+V at kBlockN=32 = 64KB staging, which
     // fits 227KB because the kernel overlays the epilogue smem_o onto the staging region (both
     // transient, never simultaneously live) -> ~196KB. bf16/fp8-native paths keep their tuned kBlockN.
-    static constexpr int kBlockN = DequantKV ? 32 : (Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS));
+    static constexpr int kBlockN = DequantKV ? 16 : (Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS));
     static constexpr bool MmaPV_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
     static constexpr bool IntraWGOverlap = std::get<3>(kBlockMN_RS_IntraWGOverlap);
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
