@@ -348,6 +348,10 @@ struct CollectiveMainloopFwdSm90 {
     // (same zero-size idiom as SmemP_t/SmemQv_t so the bf16 build is byte-identical).
     using SmemKFp8_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutKFp8>, 128>, cute::array<ElementKV, 0>>;
     using SmemVFp8_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutVFp8>, 128>, cute::array<ElementKV, 0>>;
+    // M5 B3-fast.2 kBlockN=32 fit: bytes of fp8 staging (placed first in TensorStorage). The kernel
+    // overlays the epilogue smem_o onto this region (staging is mainloop-transient, O is epilogue-
+    // transient -> never live together), reclaiming the ~32KB the smem_v-overlay would waste.
+    static constexpr int SmemKVFp8Bytes = DequantKV ? int(sizeof(SmemKFp8_t) + sizeof(SmemVFp8_t)) : 0;
     // Sometimes even with SmemP_t = cute::array<Element, 0>, putting it in the TensorStorage struct causes
     // smem size to go from 227KB to 228KB and we get "invalid argument".
 
@@ -368,6 +372,11 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
     struct TensorStorageWithPScaleNoTranspose : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP), _0> {
+        // M5 B3-fast.2 kBlockN=32 fit: fp8 staging FIRST (offset 0) so the epilogue smem_o overlays it
+        // via the SharedStorage union (both transient, never simultaneously live). 0-byte when
+        // !DequantKV -> no-op there (smem_v stays effectively first, O overlays smem_v as before).
+        SmemKFp8_t smem_k_fp8;  // M5 dequant staging (0-byte unless DequantKV)
+        SmemVFp8_t smem_v_fp8;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVtNoTranspose> smem_v;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
@@ -375,8 +384,6 @@ struct CollectiveMainloopFwdSm90 {
         SmemP_t smem_p;
         SmemScale_t smem_scale;
         cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
-        SmemKFp8_t smem_k_fp8;  // M5 dequant staging (0-byte unless DequantKV)
-        SmemVFp8_t smem_v_fp8;
     };
 
     using TensorStorageNoTranspose = std::conditional_t<
@@ -1028,14 +1035,18 @@ struct CollectiveMainloopFwdSm90 {
             // block n+1 is converted+consumed -> DRAM load overlaps convert+MMA (the missing overlap).
             if (should_load_KV) {
                 paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
+            }
+            load_Q();
+            // The fp8 staging smem is overlaid with the PREVIOUS tile's epilogue smem_o (union). The
+            // first staging load must wait for that O-store to finish -> gate it on barrier_O (same
+            // protection the non-dequant path gives smem_v). Mid-mainloop loop loads need no gate.
+            shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
+            if (should_load_KV) {
                 load_V(n_block, smem_pipe_write_fp8, cute::true_type{} /*Seqlenk_mask*/);
                 load_K(n_block, smem_pipe_write_fp8, cute::true_type{} /*Seqlenk_mask*/);
             }
             PipelineStateFp8 fp8_write_convert = smem_pipe_write_fp8;  // fp8 write-state of the block pending convert
             ++smem_pipe_write_fp8;
-
-            load_Q();
-            shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
 
             --n_block;
             #pragma unroll 1

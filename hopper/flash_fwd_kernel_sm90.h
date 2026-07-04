@@ -93,7 +93,13 @@ public:
     // Kernel level shared memory storage
     // We overlap the shared memory for the mainloop and epilogue. However, we only want smem_o to overlap with smem_v
     // and nothing else, so we'll pad in case sizeof(smem_o) > sizeof(smem_v).
-    static constexpr int mainloop_smem_padding_ = int(sizeof(typename CollectiveEpilogue::TensorStorage)) - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)));
+    // The epilogue smem_o overlays the START of the mainloop TensorStorage. For DequantKV the fp8
+    // staging is placed first and O overlays IT (staging is mainloop-transient, O epilogue-transient),
+    // so the padding keys off the staging bytes (== O -> padding 0). Otherwise O overlays smem_v.
+    static constexpr int epilogue_overlay_bytes = CollectiveMainloop::DequantKV
+        ? CollectiveMainloop::SmemKVFp8Bytes
+        : int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)));
+    static constexpr int mainloop_smem_padding_ = int(sizeof(typename CollectiveEpilogue::TensorStorage)) - epilogue_overlay_bytes;
     static constexpr int mainloop_smem_padding = mainloop_smem_padding_ < 0 ? 0 : mainloop_smem_padding_;
     struct SharedStorage {
         struct TensorStorage : cute::aligned_struct<128, _1> {
