@@ -45,13 +45,12 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, Use_one_mma_wg);
     static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_sm8x(Arch == 86 || Arch == 89, kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKVNonTMA, Varlen && Split, Has_softcap, AppendKV);
     static constexpr int kBlockM = Arch >= 90 ? std::get<0>(kBlockMN_RS_IntraWGOverlap) : std::get<0>(kBlockMN_kNWarps_Stages_RS);
-    // M5: the dequant path adds fp8 STAGING smem. B3-fast.2 double-buffers the staging for
-    // load/convert overlap. Full 2-stage K+V at kBlockN=32 = 230KB > 227KB cap (the epilogue-O
-    // union hides only ONE 64KB region; 2-stage K+V staging = 64KB is additive). So keep kBlockN=32
-    // (fewer iterations / full wgmma-N than kBlockN=16's measured 1614us) with ASYMMETRIC staging:
-    // K 2-stage (prefetch, QK critical path) + V 1-stage (converted after K so V cp.async hides
-    // behind the K-convert) = 48KB staging -> ~214KB. bf16/fp8-native paths keep their tuned kBlockN.
-    static constexpr int kBlockN = DequantKV ? 32 : (Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS));
+    // M5: the dequant path adds fp8 STAGING smem. B3-fast.2 double-buffers the staging (kStagesFp8=2)
+    // for load/convert overlap, which at kBlockN=32 measured 230KB > 227KB cap (FLASH_PRINT_SMEM).
+    // kBlockN=16 halves both the fp8 staging AND the bf16 K/V target -> ~140KB, comfortable headroom.
+    // Tradeoff: smaller N tile = more iterations / smaller wgmma-N; measured OK for the memory-bound
+    // large-KV regime (DRAM was only 11%). bf16/fp8-native paths keep their tuned kBlockN.
+    static constexpr int kBlockN = DequantKV ? 16 : (Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS));
     static constexpr bool MmaPV_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
     static constexpr bool IntraWGOverlap = std::get<3>(kBlockMN_RS_IntraWGOverlap);
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);

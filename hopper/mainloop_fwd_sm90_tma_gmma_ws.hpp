@@ -43,11 +43,10 @@ struct CollectiveMainloopFwdSm90 {
     using TileShape_MNK = TileShape_MNK_;
     using ElementKV = ElementKV_;
     static constexpr bool DequantKV = !cute::is_same_v<ElementKV, Element_>;  // fp8 storage, bf16 compute
-    // M5 B3-fast.2: fp8 STAGING pipelines. ASYMMETRIC to fit kBlockN=32 in 227KB (full 2-stage K+V
-    // = 230KB). K gets 2 stages (prefetch the QK critical path); V gets 1 stage (loaded early and
-    // converted right after K, so V's cp.async hides behind the K-convert). bf16 target = kStages(=1).
-    static constexpr int kStagesKFp8 = DequantKV ? kStages + 1 : kStages;  // 2 for dequant
-    static constexpr int kStagesVFp8 = kStages;                            // 1 for dequant
+    // M5 B3-fast.2: the fp8 STAGING pipeline needs MORE stages than the bf16 target so the
+    // cp.async load of stage n+1 stays in flight while stage n is converted+consumed (the bf16
+    // target stays kStages=1 for smem budget at kBlockN=32; separate counts, NOT global kStages=2).
+    static constexpr int kStagesFp8 = DequantKV ? kStages + 1 : kStages;
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
@@ -188,12 +187,12 @@ struct CollectiveMainloopFwdSm90 {
         decltype(cute::get<1>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutKFp8 = decltype(tile_to_shape(
         SmemLayoutAtomKFp8{},
-        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStagesKFp8>{})));
+        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStagesFp8>{})));
     using SmemLayoutAtomVFp8 = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementKV,
         decltype(cute::get<1>(TileShape_MNK{})), Int<kHeadDimV>>());
     using SmemLayoutVFp8 = decltype(tile_to_shape(
         SmemLayoutAtomVFp8{},
-        make_shape(shape<1>(TileShape_MNK{}), Int<kHeadDimV>{}, Int<kStagesVFp8>{})));
+        make_shape(shape<1>(TileShape_MNK{}), Int<kHeadDimV>{}, Int<kStagesFp8>{})));
 
     using SmemLayoutAtomP = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<1>(TileShape_MNK{}))>());
@@ -326,11 +325,10 @@ struct CollectiveMainloopFwdSm90 {
     using MainloopPipelineKVNew = PipelineTmaAsync;
     using PipelineState = cutlass::PipelineState<kStages>;
     // M5 B3-fast.2: fp8 staging pipelines (cp.async -> fp8 smem, consumed by the producer-WG
-    // convert stage). Always PipelineAsync (DequantKV is a cp.async/paged path). K 2-stage, V 1-stage.
-    using MainloopPipelineKFp8 = cutlass::PipelineAsync<kStagesKFp8>;
-    using MainloopPipelineVFp8 = cutlass::PipelineAsync<kStagesVFp8>;
-    using PipelineStateKFp8 = cutlass::PipelineState<kStagesKFp8>;
-    using PipelineStateVFp8 = cutlass::PipelineState<kStagesVFp8>;
+    // convert stage). Always PipelineAsync (DequantKV is a cp.async/paged path). Own stage count.
+    using MainloopPipelineKFp8 = cutlass::PipelineAsync<kStagesFp8>;
+    using MainloopPipelineVFp8 = cutlass::PipelineAsync<kStagesFp8>;
+    using PipelineStateFp8 = cutlass::PipelineState<kStagesFp8>;
 
     // If PackGQA, we use cp.async (instead of TMA) to load Q, so we want smem_q to be aligned
     // and have sQ being position_independent_swizzle_tensor.
@@ -662,8 +660,7 @@ struct CollectiveMainloopFwdSm90 {
          MainloopPipelineKFp8 pipeline_k_fp8,
          MainloopPipelineVFp8 pipeline_v_fp8,
          PipelineState& smem_pipe_write,
-         PipelineStateKFp8& smem_pipe_write_kfp8,
-         PipelineStateVFp8& smem_pipe_write_vfp8,
+         PipelineStateFp8& smem_pipe_write_fp8,
          SharedStorage &shared_storage,
          SchedulerPrefetch const& scheduler_prefetch,
          SeqlenInfo_t const& seqlen_info,
@@ -889,8 +886,8 @@ struct CollectiveMainloopFwdSm90 {
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             // NOTE: producer_acquire is per-branch: the DequantKV route acquires the fp8 STAGING
             // pipeline (smem_pipe_write is the fp8 state there), NOT the bf16 pipeline_k -- the bf16
-            // pipeline is acquired later, in convert_K. Acquiring pipeline_k here would double-acquire
-            // and mistype the state (PipelineStateKFp8 vs PipelineState).
+            // pipeline is acquired later, in convert_KV. Acquiring pipeline_k here would double-acquire
+            // and mistype the state (PipelineStateFp8 vs PipelineState).
             if constexpr (!PagedKVNonTMA) {
                 pipeline_k.producer_acquire(smem_pipe_write);
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
@@ -899,7 +896,7 @@ struct CollectiveMainloopFwdSm90 {
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
                 if constexpr (DequantKV) {
-                    // async cp.async fp8 -> fp8 STAGING pipeline (kStagesKFp8), no wait/convert here
+                    // async cp.async fp8 -> fp8 STAGING pipeline (kStagesFp8), no wait/convert here
                     // (the convert stage runs one block behind so this load stays in flight).
                     pipeline_k_fp8.producer_acquire(smem_pipe_write);
                     paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_fp8_stage(smem_pipe_write.index()));
@@ -958,30 +955,22 @@ struct CollectiveMainloopFwdSm90 {
         // block behind the fp8 load so the next block's cp.async stays in flight during convert+MMA.
         // `fp8_write` is the fp8 producer-state used when this block was loaded; reconstruct the
         // consumer read-state from it (phase^1) exactly as copy_Vt_to_V does for pipeline_vt.
-        // Convert one K staging stage -> bf16 pipeline_k. `kfp8_write` = the fp8 K producer-state used
-        // when this block's K was loaded (reconstruct the consumer read-state, copy_Vt_to_V idiom).
-        auto convert_K = [&] (auto const& kfp8_write, auto const& bf16_write) {
+        auto convert_KV = [&] (auto const& fp8_write, auto const& bf16_write) {
             if constexpr (DequantKV) {
-                PipelineStateKFp8 kfp8_read{kfp8_write.index(), kfp8_write.phase() ^ 1, kfp8_write.count()};
-                pipeline_k_fp8.consumer_wait(kfp8_read);
+                PipelineStateFp8 fp8_read{fp8_write.index(), fp8_write.phase() ^ 1, fp8_write.count()};
+                pipeline_k_fp8.consumer_wait(fp8_read);
+                pipeline_v_fp8.consumer_wait(fp8_read);
                 pipeline_k.producer_acquire(bf16_write);
-                convert_K_stage(kfp8_read.index(), bf16_write.index());
+                pipeline_v.producer_acquire(bf16_write);
+                convert_K_stage(fp8_read.index(), bf16_write.index());
+                convert_V_stage(fp8_read.index(), bf16_write.index());
                 cutlass::arch::fence_view_async_shared();
                 pipeline_k.producer_commit(bf16_write);
-                cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::ProducerConvert) /*id*/);
-                pipeline_k_fp8.consumer_release(kfp8_read);
-            }
-        };
-        auto convert_V = [&] (auto const& vfp8_write, auto const& bf16_write) {
-            if constexpr (DequantKV) {
-                PipelineStateVFp8 vfp8_read{vfp8_write.index(), vfp8_write.phase() ^ 1, vfp8_write.count()};
-                pipeline_v_fp8.consumer_wait(vfp8_read);
-                pipeline_v.producer_acquire(bf16_write);
-                convert_V_stage(vfp8_read.index(), bf16_write.index());
-                cutlass::arch::fence_view_async_shared();
                 pipeline_v.producer_commit(bf16_write);
+                // All producer threads must finish reading fp8 smem before the staging stage is reused.
                 cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::ProducerConvert) /*id*/);
-                pipeline_v_fp8.consumer_release(vfp8_read);
+                pipeline_k_fp8.consumer_release(fp8_read);
+                pipeline_v_fp8.consumer_release(fp8_read);
             }
         };
 
@@ -1032,45 +1021,38 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         if constexpr (DequantKV) {
-            // ---- B3-fast.2: software-pipelined fp8 dequant load (ASYMMETRIC K2/V1) ----
-            // K fp8 staging is 2-stage: load K(n-1) at the TOP of each iter (prefetch, QK critical path),
-            // convert K(n) [loaded last iter] one block behind. V fp8 staging is 1-stage: convert V(n)
-            // then load V(n-1) into the freed slot -- V's cp.async hides behind the following iter's
-            // K-convert. Both converts commit the same bf16 stage (kStages=1) that the MMA WG reads.
+            // ---- B3-fast.2: software-pipelined fp8 dequant load ----
+            // Load block n's fp8 K & V (into one fp8 staging stage, kStagesFp8) via async cp.async,
+            // then convert the PREVIOUS block fp8->bf16 (into the kStages=1 bf16 pipeline the MMA reads).
+            // The convert runs one block behind the load, so block n's cp.async stays in flight while
+            // block n+1 is converted+consumed -> DRAM load overlaps convert+MMA (the missing overlap).
             if (should_load_KV) {
                 paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
-                load_K(n_block, smem_pipe_write_kfp8, cute::true_type{} /*Seqlenk_mask*/);
-                load_V(n_block, smem_pipe_write_vfp8, cute::true_type{} /*Seqlenk_mask*/);
+                load_V(n_block, smem_pipe_write_fp8, cute::true_type{} /*Seqlenk_mask*/);
+                load_K(n_block, smem_pipe_write_fp8, cute::true_type{} /*Seqlenk_mask*/);
             }
-            // one-behind convert states: the fp8 producer-state at which the current block was loaded
-            PipelineStateKFp8 kconv = smem_pipe_write_kfp8;  ++smem_pipe_write_kfp8;
-            PipelineStateVFp8 vconv = smem_pipe_write_vfp8;  ++smem_pipe_write_vfp8;
+            PipelineStateFp8 fp8_write_convert = smem_pipe_write_fp8;  // fp8 write-state of the block pending convert
+            ++smem_pipe_write_fp8;
 
             load_Q();
             shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
 
+            --n_block;
             #pragma unroll 1
             for (; n_block >= n_block_min; --n_block) {
-                bool const has_next = n_block > n_block_min;
-                PipelineStateKFp8 kconv_next = kconv;
-                PipelineStateVFp8 vconv_next = vconv;
-                // Prefetch K(n-1) (2-stage) BEFORE converting K(n) -> K load stays in flight.
-                if (should_load_KV && has_next) {
-                    paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block - 1);
-                    load_K(n_block - 1, smem_pipe_write_kfp8, cute::false_type{} /*Seqlenk_mask*/);
-                    kconv_next = smem_pipe_write_kfp8;  ++smem_pipe_write_kfp8;
+                if (should_load_KV) {
+                    paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
+                    load_V(n_block, smem_pipe_write_fp8, cute::false_type{} /*Seqlenk_mask*/);
+                    load_K(n_block, smem_pipe_write_fp8, cute::false_type{} /*Seqlenk_mask*/);
                 }
-                convert_K(kconv, smem_pipe_write);  // K(n): consumes prefetched staging, commits bf16_k
-                convert_V(vconv, smem_pipe_write);  // V(n): frees the 1-stage V slot
-                // V slot now free -> load V(n-1); its cp.async hides behind next iter's K-convert.
-                if (should_load_KV && has_next) {
-                    load_V(n_block - 1, smem_pipe_write_vfp8, cute::false_type{} /*Seqlenk_mask*/);
-                    vconv_next = smem_pipe_write_vfp8;  ++smem_pipe_write_vfp8;
-                }
-                kconv = kconv_next; vconv = vconv_next;
+                convert_KV(fp8_write_convert, smem_pipe_write);  // convert prev block; overlaps loads above
+                fp8_write_convert = smem_pipe_write_fp8;
+                ++smem_pipe_write_fp8;
                 ++smem_pipe_write;
             }
             scheduler_prefetch();
+            convert_KV(fp8_write_convert, smem_pipe_write);  // epilogue: convert the last loaded block
+            ++smem_pipe_write;
             ++work_idx;
         } else {
             if (should_load_KV) {
@@ -1133,8 +1115,7 @@ struct CollectiveMainloopFwdSm90 {
     CUTLASS_DEVICE void
     load_tail(MainloopPipelineK pipeline_k, MainloopPipelineV pipeline_v, MainloopPipelineVt pipeline_vt,
               MainloopPipelineKFp8 pipeline_k_fp8, MainloopPipelineVFp8 pipeline_v_fp8,
-              PipelineState& smem_pipe_write,
-              PipelineStateKFp8& smem_pipe_write_kfp8, PipelineStateVFp8& smem_pipe_write_vfp8,
+              PipelineState& smem_pipe_write, PipelineStateFp8& smem_pipe_write_fp8,
               SharedStorage &shared_storage, int const work_idx) {
         // If we don't wait for barrier_O here, when using Cluster, CTA0 might exit early and CTA1 will
         // try to arrive on barrier_O of CTA0, causing "unspecified launch failure".
@@ -1151,8 +1132,8 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_v.producer_tail(smem_pipe_write);
             if constexpr (Transpose_V) { pipeline_vt.producer_tail(smem_pipe_write); }
             if constexpr (DequantKV) {
-                pipeline_k_fp8.producer_tail(smem_pipe_write_kfp8);
-                pipeline_v_fp8.producer_tail(smem_pipe_write_vfp8);
+                pipeline_k_fp8.producer_tail(smem_pipe_write_fp8);
+                pipeline_v_fp8.producer_tail(smem_pipe_write_fp8);
             }
         }
     }
