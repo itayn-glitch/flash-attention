@@ -856,12 +856,14 @@ struct CollectiveMainloopFwdSm90 {
         // since fp8/bf16 use different swizzle atoms). Partition fp8 src & bf16 dst with the SAME
         // thread/value layout over the (kBlockN,kHeadDim) tile so per-thread elements map to the
         // same logical positions; vectorized LDS fp8->regs, convert+descale in regs, vectorized STS.
-        // val=8 elems: fp8 8=64b LDS, bf16 8=128b STS. thr=(kBlockN, NumProducerThreads/kBlockN).
+        // val=16 elems: fp8 16=128b LDS (vs 2x64b at val=8), bf16 16=2x128b STS. Halves the producer's
+        // smem-load instruction count -> shorter convert -> less barrier wait (ncu was 33% CTA-barrier).
+        // thr=(kBlockN, NumProducerThreads/kBlockN).
         auto convert_tile = [&] (auto&& sf, auto&& sb, float descale) {
           if constexpr (DequantKV) {   // gate: NumProducerThreads/kBlockN is degenerate on the non-dequant TMA path
             auto thr_l = Layout<Shape<Int<kBlockN>, Int<NumProducerThreads / kBlockN>>>{};
-            auto val_l = Layout<Shape<_1, _8>>{};
-            auto tcf = make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<64>, ElementKV>{}, thr_l, val_l);
+            auto val_l = Layout<Shape<_1, _16>>{};
+            auto tcf = make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementKV>{}, thr_l, val_l);
             auto tcb = make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{}, thr_l, val_l);
             Tensor tsf = tcf.get_thread_slice(thread_idx).partition_S(sf);
             Tensor tsb = tcb.get_thread_slice(thread_idx).partition_D(sb);
