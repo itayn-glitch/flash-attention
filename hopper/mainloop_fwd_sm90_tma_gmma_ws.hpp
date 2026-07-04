@@ -49,7 +49,7 @@ struct CollectiveMainloopFwdSm90 {
     // fp8 staging 2-stage (prefetch the load 1 block ahead of the convert). Decoupled from kStages:
     // with bf16 now 2-stage (convert overlaps MMA), fp8 also 2-stage gives a clean load->convert->MMA
     // pipeline, each stage double-buffered. (Was kStages+1; now fixed 2 so bf16=2 doesn't force fp8=3.)
-    static constexpr int kStagesFp8 = DequantKV ? 2 : kStages;
+    static constexpr int kStagesFp8 = DequantKV ? 3 : kStages;  // 3: load 2 blocks ahead of convert to hide DRAM latency (ncu long_scoreboard 28%)
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
