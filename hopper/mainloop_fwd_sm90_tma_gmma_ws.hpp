@@ -43,13 +43,12 @@ struct CollectiveMainloopFwdSm90 {
     using TileShape_MNK = TileShape_MNK_;
     using ElementKV = ElementKV_;
     static constexpr bool DequantKV = !cute::is_same_v<ElementKV, Element_>;  // fp8 storage, bf16 compute
-    // M5 B3-fast.2: the fp8 STAGING pipeline needs MORE stages than the bf16 target so the
-    // cp.async load of stage n+1 stays in flight while stage n is converted+consumed (the bf16
-    // target stays kStages=1 for smem budget at kBlockN=32; separate counts, NOT global kStages=2).
-    // fp8 staging 2-stage (prefetch the load 1 block ahead of the convert). Decoupled from kStages:
-    // with bf16 now 2-stage (convert overlaps MMA), fp8 also 2-stage gives a clean load->convert->MMA
-    // pipeline, each stage double-buffered. (Was kStages+1; now fixed 2 so bf16=2 doesn't force fp8=3.)
-    static constexpr int kStagesFp8 = DequantKV ? 3 : kStages;  // 3: load 2 blocks ahead of convert to hide DRAM latency (ncu long_scoreboard 28%)
+    // M5 B3-fast.2 pipeline (DequantKV, kBlockN=16): load -> convert -> MMA, each double-buffered.
+    //   - bf16 target pipeline: kStages=2 (set in launch template) so convert(n+1) overlaps MMA(n).
+    //   - fp8 STAGING pipeline: kStagesFp8=3 so the cp.async load runs 2 blocks ahead of the convert
+    //     (hides DRAM latency). FREE up to 4: the epilogue-smem_o union overlays the staging, so extra
+    //     staging fills the previously-wasted O-alignment padding at zero total-smem cost (stays 196KB).
+    static constexpr int kStagesFp8 = DequantKV ? 3 : kStages;
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
@@ -726,14 +725,9 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
 
-        // M5 dequant: per-(batch,kv-head) descales, folded directly into the fp8->bf16
-        // convert (correctness-first; O = P·(fp8_v·v_descale) and scores = (fp8_k·k_descale)·Q
-        // are both exact, so no softmax/finalize edits needed). q stays bf16 (q_descale=1).
-        float k_descale_val = 1.0f, v_descale_val = 1.0f;
-        if constexpr (DequantKV) {
-            if (params.ptr_k_descale != nullptr) { k_descale_val = params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)]; }
-            if (params.ptr_v_descale != nullptr) { v_descale_val = params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)]; }
-        }
+        // M5 B4 reversal: the fp8->bf16 convert is PURE (descale is applied in the CONSUMER math --
+        // k_descale into pre-softmax scores, v_descale in finalize -- see mma()). No descale is loaded
+        // or applied in the producer here anymore.
 
         // Prepare the TMA loads
         uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
@@ -859,7 +853,10 @@ struct CollectiveMainloopFwdSm90 {
         // val=16 elems: fp8 16=128b LDS (vs 2x64b at val=8), bf16 16=2x128b STS. Halves the producer's
         // smem-load instruction count -> shorter convert -> less barrier wait (ncu was 33% CTA-barrier).
         // thr=(kBlockN, NumProducerThreads/kBlockN).
-        auto convert_tile = [&] (auto&& sf, auto&& sb, float descale) {
+        // B4 reversal: PURE fp8->bf16 convert (lossless: bf16 mantissa 8b >= fp8 3b). Descale is applied
+        // in the CONSUMER math (k_descale into pre-softmax scores, v_descale in finalize -- see mma()),
+        // off the producer critical path (measured -6% barrier stall vs folding descale here).
+        auto convert_tile = [&] (auto&& sf, auto&& sb) {
           if constexpr (DequantKV) {   // gate: NumProducerThreads/kBlockN is degenerate on the non-dequant TMA path
             auto thr_l = Layout<Shape<Int<kBlockN>, Int<NumProducerThreads / kBlockN>>>{};
             auto val_l = Layout<Shape<_1, _16>>{};
@@ -871,24 +868,20 @@ struct CollectiveMainloopFwdSm90 {
             Tensor rb = make_fragment_like(tsb);
             cute::copy(tcf, tsf, rf);
             CUTLASS_PRAGMA_UNROLL
-            // B4 reversal: PURE fp8->bf16 convert (fp8->bf16 is lossless: bf16 mantissa 8b >= fp8 3b).
-            // descale is applied in the CONSUMER math instead (k_descale into pre-softmax scores,
-            // v_descale into finalize) -- off the producer critical path (measured -6% barrier stall).
             for (int j = 0; j < size(rf); ++j) { rb(j) = static_cast<Element>(float(rf(j))); }
-            (void)descale;
             cute::copy(tcb, rb, tsb);
           }
         };
         auto convert_K_stage = [&] (int fp8_stage, int bf16_stage) {
             if constexpr (DequantKV) {
                 Tensor sKf = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k_fp8.data()), SmemLayoutKFp8{}))(_, _, fp8_stage);
-                convert_tile(sKf, sK_pi(_, _, bf16_stage), k_descale_val);
+                convert_tile(sKf, sK_pi(_, _, bf16_stage));
             }
         };
         auto convert_V_stage = [&] (int fp8_stage, int bf16_stage) {
             if constexpr (DequantKV) {
                 Tensor sVf = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_fp8.data()), SmemLayoutVFp8{}))(_, _, fp8_stage);
-                convert_tile(sVf, sVcpasync(_, _, bf16_stage), v_descale_val);
+                convert_tile(sVf, sVcpasync(_, _, bf16_stage));
             }
         };
         // fp8 staging targets for the paged cp.async loads (also gated).
