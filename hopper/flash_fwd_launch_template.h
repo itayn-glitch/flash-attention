@@ -45,9 +45,12 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, Use_one_mma_wg);
     static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_sm8x(Arch == 86 || Arch == 89, kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKVNonTMA, Varlen && Split, Has_softcap, AppendKV);
     static constexpr int kBlockM = Arch >= 90 ? std::get<0>(kBlockMN_RS_IntraWGOverlap) : std::get<0>(kBlockMN_kNWarps_Stages_RS);
-    // M5: the dequant path adds fp8 staging smem, so it must run kBlockN=32 (kBlockN=64 +
-    // staging = 268KB > 227KB, measured B1). bf16/fp8-native paths keep their tuned kBlockN.
-    static constexpr int kBlockN = DequantKV ? 32 : (Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS));
+    // M5: the dequant path adds fp8 STAGING smem. B3-fast.2 double-buffers the staging (kStagesFp8=2)
+    // for load/convert overlap, which at kBlockN=32 measured 230KB > 227KB cap (FLASH_PRINT_SMEM).
+    // kBlockN=16 halves both the fp8 staging AND the bf16 K/V target -> ~140KB, comfortable headroom.
+    // Tradeoff: smaller N tile = more iterations / smaller wgmma-N; measured OK for the memory-bound
+    // large-KV regime (DRAM was only 11%). bf16/fp8-native paths keep their tuned kBlockN.
+    static constexpr int kBlockN = DequantKV ? 16 : (Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS));
     static constexpr bool MmaPV_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
     static constexpr bool IntraWGOverlap = std::get<3>(kBlockMN_RS_IntraWGOverlap);
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
