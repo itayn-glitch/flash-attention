@@ -871,7 +871,10 @@ struct CollectiveMainloopFwdSm90 {
             Tensor rb = make_fragment_like(tsb);
             cute::copy(tcf, tsf, rf);
             CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < size(rf); ++j) { rb(j) = static_cast<Element>(float(rf(j)) * descale); }
+            // B4-PROBE (perf-only, numerically INVALID -- REVERT before correctness): drop the FP32
+            // descale mult to test whether producer-convert length feeds the 32% barrier stall.
+            for (int j = 0; j < size(rf); ++j) { rb(j) = static_cast<Element>(float(rf(j))); }
+            (void)descale;
             cute::copy(tcb, rb, tsb);
           }
         };
