@@ -197,7 +197,8 @@ public:
         using MainloopPipelineKFp8 = typename CollectiveMainloop::MainloopPipelineKFp8;
         using MainloopPipelineVFp8 = typename CollectiveMainloop::MainloopPipelineVFp8;
         using PipelineState = typename CollectiveMainloop::PipelineState;
-        using PipelineStateFp8 = typename CollectiveMainloop::PipelineStateFp8;
+        using PipelineStateKFp8 = typename CollectiveMainloop::PipelineStateKFp8;
+        using PipelineStateVFp8 = typename CollectiveMainloop::PipelineStateVFp8;
         static constexpr bool DequantKV = CollectiveMainloop::DequantKV;
         using PipelineParamsK = typename MainloopPipelineK::Params;
         using PipelineParamsV = typename MainloopPipelineV::Params;
@@ -300,14 +301,20 @@ public:
 
         // M5 B3-fast.2: fp8 staging pipelines (cp.async). Producer = load WG (WG0); the same WG0 is
         // also the consumer (the convert stage). Only WG0 touches them, so arv counts = NumProducerThreads.
-        typename MainloopPipelineKFp8::Params pipeline_params_fp8;
-        pipeline_params_fp8.role = warp_group_idx == 0
+        typename MainloopPipelineKFp8::Params pipeline_params_kfp8;
+        pipeline_params_kfp8.role = warp_group_idx == 0
             ? MainloopPipelineKFp8::ThreadCategory::Producer
             : MainloopPipelineKFp8::ThreadCategory::Consumer;
-        pipeline_params_fp8.producer_arv_count = NumProducerThreads;
-        pipeline_params_fp8.consumer_arv_count = NumProducerThreads;
-        MainloopPipelineKFp8 pipeline_k_fp8(shared_storage.pipelines.pipeline_k_fp8, pipeline_params_fp8);
-        MainloopPipelineVFp8 pipeline_v_fp8(shared_storage.pipelines.pipeline_v_fp8, pipeline_params_fp8);
+        pipeline_params_kfp8.producer_arv_count = NumProducerThreads;
+        pipeline_params_kfp8.consumer_arv_count = NumProducerThreads;
+        MainloopPipelineKFp8 pipeline_k_fp8(shared_storage.pipelines.pipeline_k_fp8, pipeline_params_kfp8);
+        typename MainloopPipelineVFp8::Params pipeline_params_vfp8;
+        pipeline_params_vfp8.role = warp_group_idx == 0
+            ? MainloopPipelineVFp8::ThreadCategory::Producer
+            : MainloopPipelineVFp8::ThreadCategory::Consumer;
+        pipeline_params_vfp8.producer_arv_count = NumProducerThreads;
+        pipeline_params_vfp8.consumer_arv_count = NumProducerThreads;
+        MainloopPipelineVFp8 pipeline_v_fp8(shared_storage.pipelines.pipeline_v_fp8, pipeline_params_vfp8);
 
         PipelineParamsKVNew pipeline_params_kv_new;
         pipeline_params_kv_new.role = warp_group_idx == 0
@@ -351,7 +358,8 @@ public:
             // KV_new. Since the pipeline states are different, we have to manually sync to make
             // sure the two pipelines don't race when accessing smem_k and smem_v.
             PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
-            PipelineStateFp8 smem_pipe_write_fp8 = cutlass::make_producer_start_state<MainloopPipelineKFp8>();
+            PipelineStateKFp8 smem_pipe_write_kfp8 = cutlass::make_producer_start_state<MainloopPipelineKFp8>();
+            PipelineStateVFp8 smem_pipe_write_vfp8 = cutlass::make_producer_start_state<MainloopPipelineVFp8>();
             PipelineState smem_pipe_write_new = cutlass::make_producer_start_state<MainloopPipelineKVNew>();
             int work_idx = 0;
             int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
@@ -396,11 +404,11 @@ public:
                 };
                 // pipeline_vt won't be used if we don't need to transpose V.
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_k_fp8, pipeline_v_fp8,
-                                         smem_pipe_write, smem_pipe_write_fp8,
+                                         smem_pipe_write, smem_pipe_write_kfp8, smem_pipe_write_vfp8,
                                          shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_k_fp8, pipeline_v_fp8,
-                               smem_pipe_write, smem_pipe_write_fp8, shared_storage, work_idx);
+                               smem_pipe_write, smem_pipe_write_kfp8, smem_pipe_write_vfp8, shared_storage, work_idx);
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
