@@ -55,10 +55,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr bool IntraWGOverlap = std::get<3>(kBlockMN_RS_IntraWGOverlap);
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
     // Square head-512 (kHeadDim>256): 2 stages of K+V must fit H100's 227KB smem.
-    //   bf16 K+V = 2*(64*512*2B) = 128KB/stage -> only 1 stage fits (OQ2 bf16 limit).
+    //   bf16 K+V = 2*(64*512*2B) = 128KB/stage -> only 1 stage fits at kBlockN=64 (OQ2 bf16 limit).
     //   fp8  K+V = 2*(64*512*1B) =  64KB/stage -> 2 stages fit (fp8 is the pipelining enabler).
+    // M5 B3-fast.2: DequantKV runs kBlockN=16, so bf16 K+V 2-stage = 2*(16*512*2B) = 32KB -> fits.
+    // bf16 2-stage lets convert(n+1) overlap MMA(n) (ncu: kStages=1 was 34% CTA-barrier bound from
+    // the convert<->MMA ping-pong on the single bf16 buffer). O/staging union keeps total ~194KB.
     static constexpr int kStages = Arch >= 90
-        ? (kHeadDim > 256 ? (sizeof(Element) == 1 ? 2 : 1) : 2)
+        ? (kHeadDim > 256 ? (sizeof(Element) == 1 ? 2 : (DequantKV ? 2 : 1)) : 2)
         : std::get<3>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 

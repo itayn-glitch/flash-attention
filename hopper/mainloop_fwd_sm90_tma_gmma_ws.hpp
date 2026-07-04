@@ -46,7 +46,10 @@ struct CollectiveMainloopFwdSm90 {
     // M5 B3-fast.2: the fp8 STAGING pipeline needs MORE stages than the bf16 target so the
     // cp.async load of stage n+1 stays in flight while stage n is converted+consumed (the bf16
     // target stays kStages=1 for smem budget at kBlockN=32; separate counts, NOT global kStages=2).
-    static constexpr int kStagesFp8 = DequantKV ? kStages + 1 : kStages;
+    // fp8 staging 2-stage (prefetch the load 1 block ahead of the convert). Decoupled from kStages:
+    // with bf16 now 2-stage (convert overlaps MMA), fp8 also 2-stage gives a clean load->convert->MMA
+    // pipeline, each stage double-buffered. (Was kStages+1; now fixed 2 so bf16=2 doesn't force fp8=3.)
+    static constexpr int kStagesFp8 = DequantKV ? 2 : kStages;
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
