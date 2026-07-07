@@ -358,6 +358,11 @@ struct CollectiveMainloopFwdSm90 {
     // smem size to go from 227KB to 228KB and we get "invalid argument".
 
     struct TensorStorageWithoutPNoTranspose : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose), _0> {
+        // M5 dequant fp8 staging FIRST (0-byte unless DequantKV; epilogue smem_o overlays it). Present
+        // in every NoTranspose variant so the sK_fp8_stage/convert lambda bodies compile for any config
+        // (a lambda body is instantiated even when only called under if constexpr(DequantKV)).
+        SmemKFp8_t smem_k_fp8;
+        SmemVFp8_t smem_v_fp8;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVtNoTranspose> smem_v;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
@@ -366,6 +371,8 @@ struct CollectiveMainloopFwdSm90 {
     };
 
     struct TensorStorageWithPNoTranspose : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP), _0> {
+        SmemKFp8_t smem_k_fp8;   // 0-byte unless DequantKV (see WithoutP note)
+        SmemVFp8_t smem_v_fp8;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVtNoTranspose> smem_v;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;

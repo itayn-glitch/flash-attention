@@ -148,6 +148,10 @@ def get_all_kernels() -> List[Kernel]:
             continue
         if sm >= 90 or dtype in DTYPE_MAP_FWD_SM8x:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
+        # M6 dequant-on-load for the head-256 sliding-window (local) layers: fp8 KV storage -> bf16
+        # compute (ElementKV=e4m3). cp.async paged path only (PagedKVNonTMA), so emit for paged_kv.
+        if sm == 90 and head_dim == 256 and dtype == "bf16" and paged_kv:
+            yield Kernel(sm=sm, dtype=dtype, head_dim=256, head_dim_v=256, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd", dequant=True)
         if sm == 90 and head_dim == 192:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=128, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
         if sm == 90 and head_dim == 64 and dtype in ["bf16", "fp16"]:

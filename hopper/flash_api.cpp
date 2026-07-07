@@ -325,7 +325,20 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 }
                                 #endif
                                 #ifndef FLASHATTENTION_DISABLE_HDIM256
-                                if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+                                if (params.d <= 256) {
+                                    #ifndef FLASHATTENTION_DISABLE_DEQUANTKV
+                                    // M6 dequant-on-load for the head-256 sliding-window (local) layers:
+                                    // bf16 q + fp8 KV cache -> ElementKV=e4m3. Same gate/contract as head-512.
+                                    // DequantKV forces kBlockN=16 (fits smem; the stock bf16 head-256 kBlockN=80
+                                    // tile is 228KB and only ever used for bf16 KV, not this fp8 path).
+                                    if constexpr (Arch == 90) {
+                                        if (params.kv_is_fp8 && PagedKVNonTMA) {
+                                            return run_mha_fwd_<90, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA, cutlass::float_e4m3_t>(params, stream);
+                                        }
+                                    }
+                                    #endif
+                                    return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                }
                                 #endif
                                 #ifndef FLASHATTENTION_DISABLE_HDIM512
                                 // Square head-512 (Gemma4 global). Sm90-only (LargeHeadDimV machinery);
