@@ -254,7 +254,11 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                                     // Non-unary values of kBlockH can improve GQA perf for specific ratios (4, 8, 16) by enabling TMA for loading Q
                                     // Disable for hdim diff, fp16, 1 mma wg or split to shrink build
                                     static constexpr int kBlockH = !PackGQA || Arch < 90 || (kHeadDim != kHeadDimV) || cute::is_same_v<T, cutlass::half_t> || Use_one_mma_wg || Split ? 1 : kBlockH_;
-                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, ElementKV>(params, stream);
+                                    // M7-TMA: the TMA fp8 producer (DequantKV && !PagedKVNonTMA) does not
+                                    // support AppendKV; host-side get_pagedkv_tma already excludes knew_ptr,
+                                    // so drop the dead AppendKV instantiation for that combo.
+                                    static constexpr bool DequantKV_rm = !cute::is_same_v<ElementKV, T>;
+                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen && !(DequantKV_rm && !PagedKVNonTMA), HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, ElementKV>(params, stream);
                                 });
                             });
                         });

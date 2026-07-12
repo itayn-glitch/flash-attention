@@ -72,8 +72,8 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
     // M7-TMA page-16 producer: TMA loads the fp8 bytes of the paged cache straight into the
     // fp8 staging pipeline (replacing the per-thread cp.async gather); convert stage unchanged.
-    static constexpr bool TmaFp8 = DequantKV && Use_TMA_KV;
-    static_assert(!(TmaFp8 && AppendKV_), "TMA fp8 producer does not support AppendKV");
+    // (AppendKV is excluded for this combo at the run_mha_fwd_ dispatch level.)
+    static constexpr bool TmaFp8 = DequantKV && Use_TMA_KV && !AppendKV_;
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
