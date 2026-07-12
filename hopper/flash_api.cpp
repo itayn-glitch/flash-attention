@@ -3,6 +3,7 @@
  ******************************************************************************/
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
+#include <cstdlib>  // M7-TMA env gate
 #include <torch/nn/functional.h>
 #include <torch/version.h>  // For TORCH_VERSION* macros
 #include <ATen/cuda/CUDAContext.h>
@@ -336,7 +337,9 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                         // M5 dequant-on-load: bf16 q + fp8 KV cache -> ElementKV=e4m3 instantiation.
                                         // HARD GATE: only when the KV cache is actually fp8 (contract enforced in
                                         // set_params_fwd). PagedKVNonTMA (cp.async) is required for the fp8 gather.
-                                        if (params.kv_is_fp8 && PagedKVNonTMA) {
+                                        if (params.kv_is_fp8) {
+                                            // M7-TMA: PagedKVNonTMA=false selects the TMA page-16 producer
+                                            // (env FLASH_M7_TMA_PAGED=1 via get_pagedkv_tma); true = deployed cp.async.
                                             return run_mha_fwd_<90, cutlass::bfloat16_t, 512, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA, cutlass::float_e4m3_t>(params, stream);
                                         }
                                         #endif
@@ -455,9 +458,19 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
     #endif
 }
 
+// M7-TMA: opt-in TMA page-16 producer for the fp8-KV dequant route (A/B vs cp.async in one binary).
+inline bool m7_tma_paged_enabled() {
+    static bool v = [] { char const* e = std::getenv("FLASH_M7_TMA_PAGED"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
+
 inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
     // disable for local since we move k_ptr to start of sliding window by m_block
     if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr || params.is_local) { return false; }
+    if (params.kv_is_fp8) {
+        // DequantKV kernels run kBlockN=16 (launch-template override); page 16 -> 1 page per tile.
+        return m7_tma_paged_enabled() && params.page_size % 16 == 0;
+    }
     // This needs to match the kernel configs
     auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f, use_one_mma_wg(params));
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
@@ -667,6 +680,7 @@ mha_fwd_get_scheduler_metadata(
     params.pagedkv_tma = get_pagedkv_tma(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    if (params.kv_is_fp8) { params.pack_gqa = true; }  // M7-TMA: match deployed PackGQA=true instantiations
     // Always enable PackGQA for Split
     params.pack_gqa |= params.num_splits > 1;
     // printf("Num splits (metadata) = %d.\n", params.num_splits);
@@ -1067,6 +1081,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
     // printf("Num splits = %d.\n", params.num_splits);
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    if (params.kv_is_fp8) { params.pack_gqa = true; }  // M7-TMA: match deployed PackGQA=true instantiations
     // Always enable PackGQA for Split
     params.pack_gqa |= (params.num_splits > 1);
     #ifdef FLASHATTENTION_PACKGQA_ONLY

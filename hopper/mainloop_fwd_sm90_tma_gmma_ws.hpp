@@ -70,6 +70,10 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
     static constexpr bool Use_TMA_Q = !PackGQA || PackGQA_TMA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
+    // M7-TMA page-16 producer: TMA loads the fp8 bytes of the paged cache straight into the
+    // fp8 staging pipeline (replacing the per-thread cp.async gather); convert stage unchanged.
+    static constexpr bool TmaFp8 = DequantKV && Use_TMA_KV;
+    static_assert(!(TmaFp8 && AppendKV_), "TMA fp8 producer does not support AppendKV");
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
@@ -134,7 +138,9 @@ struct CollectiveMainloopFwdSm90 {
 
     static constexpr int NumMmaThreadsQK = size(TiledMmaQK{});
     static constexpr int NumMmaThreads = size(TiledMmaPV{});
-    static constexpr int NumProducerThreads = !Transpose_V && Use_TMA_KV && Use_TMA_Q ? cutlass::NumThreadsPerWarp : cutlass::NumThreadsPerWarpGroup;
+    // M7-TMA: DequantKV keeps the full-warpgroup producer even when KV is TMA-loaded -- the
+    // fp8->bf16 convert stage is the producer WG's job and its tiled-copy layout needs 128 threads.
+    static constexpr int NumProducerThreads = !Transpose_V && Use_TMA_KV && Use_TMA_Q && !DequantKV ? cutlass::NumThreadsPerWarp : cutlass::NumThreadsPerWarpGroup;
     static_assert(NumMmaThreadsQK % cutlass::NumThreadsPerWarpGroup == 0);
     static_assert(NumMmaThreads % cutlass::NumThreadsPerWarpGroup == 0);
     static constexpr int NumMmaWarpGroups = NumMmaThreads / cutlass::NumThreadsPerWarpGroup;
@@ -305,6 +311,25 @@ struct CollectiveMainloopFwdSm90 {
         select<1, 2>(TileShape_MNK_PV{}),
         size<0>(ClusterShape{}))); // mcast along M mode for this N load, if any
 
+    // M7-TMA: TMA copies typed on the fp8 STORAGE element, landing in the fp8 staging smem.
+    // K tile is the B-operand (kBlockN, kHeadDim); V is loaded row-major (kBlockN, kHeadDimV)
+    // to match the staging layout the convert stage already reads.
+    using TileShape_MNKV_fp8 = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDimV>>;
+    using TMA_K_fp8_t = decltype(make_tma_copy_B_sm90(
+        GmemTiledCopyKV{},
+        make_tensor(make_gmem_ptr(static_cast<ElementKV const*>(nullptr)), ShapeQKV{}, StrideQK{}),
+        take<0, 2>(SmemLayoutKFp8{}),
+        TileShape_MNK{},
+        ClusterShape{}));
+    using TMA_V_fp8_t = decltype(make_tma_copy_B_sm90(
+        GmemTiledCopyKV{},
+        make_tensor(make_gmem_ptr(static_cast<ElementKV const*>(nullptr)), ShapeQKV{}, StrideQK{}),
+        take<0, 2>(SmemLayoutVFp8{}),
+        TileShape_MNKV_fp8{},
+        ClusterShape{}));
+    using TMA_K_sel = std::conditional_t<TmaFp8, TMA_K_fp8_t, TMA_K>;
+    using TMA_V_sel = std::conditional_t<TmaFp8, TMA_V_fp8_t, TMA_V>;
+
     using TMA_Qv_ = decltype(make_tma_copy_A_sm90(
         GmemTiledCopyQ{},
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQK{}),
@@ -318,18 +343,27 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutVt{})) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesQv = static_cast<uint32_t>(size(SmemLayoutQv{}) * cutlass::sizeof_bits_v<Element> / 8);
+    // M7-TMA: one fp8 staging stage per K/V tile
+    static constexpr uint32_t TmaTransactionBytesKFp8 = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutKFp8{})) * cutlass::sizeof_bits_v<ElementKV> / 8);
+    static constexpr uint32_t TmaTransactionBytesVFp8 = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutVFp8{})) * cutlass::sizeof_bits_v<ElementKV> / 8);
 
     using PipelineTmaAsync = std::conditional_t<CUTE_STATIC_V(size(ClusterShape{})) == 1, typename cutlass::PipelineTmaAsyncNoCluster<kStages>, typename cutlass::PipelineTmaAsync<kStages>>;
-    using MainloopPipelineK = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
-    using MainloopPipelineV = std::conditional_t<!Transpose_V && Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
-    using MainloopPipelineVt = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
+    // M7-TMA: under DequantKV the bf16 K/V pipelines are produced by the CONVERT stage
+    // (plain producer_commit), so they must stay PipelineAsync even when KV loads are TMA.
+    static constexpr bool Use_TMA_KV_bf16 = Use_TMA_KV && !DequantKV;
+    using MainloopPipelineK = std::conditional_t<Use_TMA_KV_bf16, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
+    using MainloopPipelineV = std::conditional_t<!Transpose_V && Use_TMA_KV_bf16, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
+    using MainloopPipelineVt = std::conditional_t<Use_TMA_KV_bf16, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     // We always use TMA for K_new and V_new
     using MainloopPipelineKVNew = PipelineTmaAsync;
     using PipelineState = cutlass::PipelineState<kStages>;
     // M5 B3-fast.2: fp8 staging pipelines (cp.async -> fp8 smem, consumed by the producer-WG
     // convert stage). Always PipelineAsync (DequantKV is a cp.async/paged path). Own stage count.
-    using MainloopPipelineKFp8 = cutlass::PipelineAsync<kStagesFp8>;
-    using MainloopPipelineVFp8 = cutlass::PipelineAsync<kStagesFp8>;
+    // M7-TMA: when the producer is TMA, the staging pipeline must be a TMA (transaction-bytes)
+    // pipeline; the cp.async producer keeps the plain async pipeline (deployed behavior).
+    using PipelineTmaAsyncFp8 = std::conditional_t<CUTE_STATIC_V(size(ClusterShape{})) == 1, typename cutlass::PipelineTmaAsyncNoCluster<kStagesFp8>, typename cutlass::PipelineTmaAsync<kStagesFp8>>;
+    using MainloopPipelineKFp8 = std::conditional_t<TmaFp8, PipelineTmaAsyncFp8, typename cutlass::PipelineAsync<kStagesFp8>>;
+    using MainloopPipelineVFp8 = std::conditional_t<TmaFp8, PipelineTmaAsyncFp8, typename cutlass::PipelineAsync<kStagesFp8>>;
     using PipelineStateFp8 = cutlass::PipelineState<kStagesFp8>;
 
     // If PackGQA, we use cp.async (instead of TMA) to load Q, so we want smem_q to be aligned
@@ -505,8 +539,8 @@ struct CollectiveMainloopFwdSm90 {
         cutlass::FastDivmod blockN_per_page_size_divmod;
         cutlass::FastDivmod qhead_per_khead_divmod;
         TMA_Q tma_load_Q;
-        TMA_K tma_load_K;
-        TMA_V tma_load_V;
+        TMA_K_sel tma_load_K;
+        TMA_V_sel tma_load_V;
         TMA_K tma_load_K_new;
         TMA_V tma_load_V_new;
         TMA_Qv tma_load_Qv;
@@ -554,21 +588,39 @@ struct CollectiveMainloopFwdSm90 {
             TileShape_MNK{},
             ClusterShape{}); // no mcast for Q
         Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), args.shape_K, args.stride_K);
-        TMA_K tma_load_K = make_tma_copy_B_sm90(
-            GmemTiledCopyKV{},
-            mK,
-            take<0, 2>(SmemLayoutK{}),
-            TileShape_MNK{},
-            ClusterShape{}); // mcast along M mode for this N load, if any
+        TMA_K_sel tma_load_K = [&] {
+            if constexpr (TmaFp8) {
+                // M7-TMA: tensor-map over the fp8 bytes of the (paged) cache
+                Tensor mK_fp8 = make_tensor(make_gmem_ptr(reinterpret_cast<ElementKV const*>(args.ptr_K)), args.shape_K, args.stride_K);
+                return make_tma_copy_B_sm90(GmemTiledCopyKV{}, mK_fp8, take<0, 2>(SmemLayoutKFp8{}), TileShape_MNK{}, ClusterShape{});
+            } else {
+                return make_tma_copy_B_sm90(
+                    GmemTiledCopyKV{},
+                    mK,
+                    take<0, 2>(SmemLayoutK{}),
+                    TileShape_MNK{},
+                    ClusterShape{}); // mcast along M mode for this N load, if any
+            }
+        }();
         Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V),
                                 make_shape(args.headdim_v, get<0>(args.shape_K), get<2>(args.shape_K), get<3>(args.shape_K)),
                                 select<1, 0, 2, 3>(args.stride_V));
-        TMA_V tma_load_V = make_tma_copy(
-            GmemTiledCopyKV{},
-            mV,
-            take<0, 2>(SmemLayoutVt{}),
-            select<1, 2>(TileShape_MNK_PV{}),
-            size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+        TMA_V_sel tma_load_V = [&] {
+            if constexpr (TmaFp8) {
+                // M7-TMA: V loaded row-major (seqlen, dv) into the fp8 staging layout
+                Tensor mV_fp8 = make_tensor(make_gmem_ptr(reinterpret_cast<ElementKV const*>(args.ptr_V)),
+                                            make_shape(get<0>(args.shape_K), args.headdim_v, get<2>(args.shape_K), get<3>(args.shape_K)),
+                                            args.stride_V);
+                return make_tma_copy_B_sm90(GmemTiledCopyKV{}, mV_fp8, take<0, 2>(SmemLayoutVFp8{}), TileShape_MNKV_fp8{}, ClusterShape{});
+            } else {
+                return make_tma_copy(
+                    GmemTiledCopyKV{},
+                    mV,
+                    take<0, 2>(SmemLayoutVt{}),
+                    select<1, 2>(TileShape_MNK_PV{}),
+                    size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+            }
+        }();
         Tensor mKnew = make_tensor(make_gmem_ptr(args.ptr_K_new), args.shape_K_new, args.stride_K_new);
         TMA_K tma_load_K_new = make_tma_copy_B_sm90(
             GmemTiledCopyKV{},
@@ -744,7 +796,13 @@ struct CollectiveMainloopFwdSm90 {
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
         Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, _);
-        auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
+        auto shape_V = [&] {
+            if constexpr (TmaFp8) {  // M7-TMA: V is TMA-loaded row-major (seqlen, dv)
+                return make_shape(get<0>(params.shape_K), params.headdim_v, get<2>(params.shape_K), get<3>(params.shape_K));
+            } else {
+                return make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
+            }
+        }();
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);
 
         Tensor gQ = local_tile(
@@ -758,7 +816,13 @@ struct CollectiveMainloopFwdSm90 {
         // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
         // Now add n_offset to update KV gmem pointers
         Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k + n_offset, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
-        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k + n_offset, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
+        Tensor gVt_TMA = [&] {
+            if constexpr (TmaFp8) {  // (N, DV, _, _) row-major page tiles
+                return local_tile(domain_offset(make_coord(seqlen_info.offset_k + n_offset, _0{}, _0{}), mVt_TMA), select<1, 2>(TileShape_MNKV_fp8{}), make_coord(_, _0{}, _));
+            } else {
+                return local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k + n_offset, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
+            }
+        }();
 
         auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));  // (TMA)
@@ -766,10 +830,24 @@ struct CollectiveMainloopFwdSm90 {
         // tma_partition doesn't handle position_independent_swizzle_tensor correctly, so we need to do it manually
         auto block_tma_K = params.tma_load_K.get_slice(cluster_local_block_id.x);
         Tensor tKgK_TMA = group_modes<0, 3>(block_tma_K.partition_S(gK_TMA));  // (TMA, k, batch)
-        Tensor tKsK_TMA = group_modes<0, 3>(block_tma_K.partition_D(sK));  // (TMA, PIPE)
+        Tensor tKsK_TMA = [&] {
+            if constexpr (TmaFp8) {
+                Tensor sKf8 = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k_fp8.data()), SmemLayoutKFp8{});
+                return group_modes<0, 3>(block_tma_K.partition_D(sKf8));  // (TMA, PIPE_FP8)
+            } else {
+                return group_modes<0, 3>(block_tma_K.partition_D(sK));  // (TMA, PIPE)
+            }
+        }();
         auto block_tma_V = params.tma_load_V.get_slice(cluster_local_block_id.x);
         Tensor tVgVt_TMA = group_modes<0, 3>(block_tma_V.partition_S(gVt_TMA));  // (TMA, k, batch)
-        Tensor tVsVt_TMA = group_modes<0, 3>(block_tma_V.partition_D(sVt));  // (TMA, PIPE)
+        Tensor tVsVt_TMA = [&] {
+            if constexpr (TmaFp8) {
+                Tensor sVf8 = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_fp8.data()), SmemLayoutVFp8{});
+                return group_modes<0, 3>(block_tma_V.partition_D(sVf8));  // (TMA, PIPE_FP8)
+            } else {
+                return group_modes<0, 3>(block_tma_V.partition_D(sVt));  // (TMA, PIPE)
+            }
+        }();
         auto [tQvgQv, tQvsQv] = [&] {
             if constexpr (HasQv) {
                 auto shape_Qv = make_shape(get<0>(params.shape_Q), params.headdim_v, get<2>(params.shape_Q), get<3>(params.shape_Q));
@@ -904,10 +982,19 @@ struct CollectiveMainloopFwdSm90 {
             // pipeline is acquired later, in convert_KV. Acquiring pipeline_k here would double-acquire
             // and mistype the state (PipelineStateFp8 vs PipelineState).
             if constexpr (!PagedKVNonTMA) {
+                if constexpr (DequantKV) {
+                    // M7-TMA: TMA the fp8 page into the fp8 STAGING pipeline (TMA pipeline;
+                    // producer_acquire posts the expect-tx). Convert stage unchanged.
+                    pipeline_k_fp8.producer_acquire(smem_pipe_write);
+                    auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
+                    copy(params.tma_load_K.with(*pipeline_k_fp8.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
+                        tKgK_TMA(_, n_block_idx, bidb_kv_idx), tKsK_TMA(_, smem_pipe_write.index()));
+                } else {
                 pipeline_k.producer_acquire(smem_pipe_write);
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
                     tKgK_TMA(_, n_block_idx, bidb_kv_idx), tKsK_TMA(_, smem_pipe_write.index()));
+                }
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
                 if constexpr (DequantKV) {
@@ -927,11 +1014,19 @@ struct CollectiveMainloopFwdSm90 {
         auto load_V = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             // producer_acquire is per-branch (see load_K): DequantKV acquires the fp8 STAGING pipeline.
             if constexpr (!PagedKVNonTMA) {
+                if constexpr (DequantKV) {
+                    // M7-TMA: fp8 V page -> fp8 staging pipeline
+                    pipeline_v_fp8.producer_acquire(smem_pipe_write);
+                    auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_V_TMA();
+                    copy(params.tma_load_V.with(*pipeline_v_fp8.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
+                        tVgVt_TMA(_, n_block_idx, bidb_kv_idx), tVsVt_TMA(_, smem_pipe_write.index()));
+                } else {
                 auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
                 pipeline_v_load.producer_acquire(smem_pipe_write);
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_V_TMA();
                 copy(params.tma_load_V.with(*pipeline_v_load.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
                     tVgVt_TMA(_, n_block_idx, bidb_kv_idx), tVsVt_TMA(_, smem_pipe_write.index()));
+                }
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
                 if constexpr (DequantKV) {
@@ -1042,7 +1137,11 @@ struct CollectiveMainloopFwdSm90 {
             // The convert runs one block behind the load, so block n's cp.async stays in flight while
             // block n+1 is converted+consumed -> DRAM load overlaps convert+MMA (the missing overlap).
             if (should_load_KV) {
-                paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
+                if constexpr (!PagedKVNonTMA) {
+                    paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
+                } else {
+                    paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
+                }
             }
             load_Q();
             // The fp8 staging smem is overlaid with the PREVIOUS tile's epilogue smem_o (union). The
@@ -1060,7 +1159,11 @@ struct CollectiveMainloopFwdSm90 {
             #pragma unroll 1
             for (; n_block >= n_block_min; --n_block) {
                 if (should_load_KV) {
-                    paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
+                    if constexpr (!PagedKVNonTMA) {
+                        paged_kv_manager.load_page_table_TMA(n_block);
+                    } else {
+                        paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
+                    }
                     load_V(n_block, smem_pipe_write_fp8, cute::false_type{} /*Seqlenk_mask*/);
                     load_K(n_block, smem_pipe_write_fp8, cute::false_type{} /*Seqlenk_mask*/);
                 }

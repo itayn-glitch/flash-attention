@@ -579,6 +579,11 @@ if not SKIP_CUDA_BUILD:
             # (the instantiation's actual PackGQA arg is still true via packgqa|paged|split).
             sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim512_bf16_dequantkv_paged{split}{softcap}_sm90.cu"
                                  for split, softcap in itertools.product(SPLIT, SOFTCAP)]
+            # M7-TMA page-16 producer instantiations (PagedKVNonTMA=false, PackGQA=true)
+            sources_fwd_sm90 += ["instantiations/flash_fwd_hdim512_bf16_dequantkv_packgqa_sm90.cu",
+                                 "instantiations/flash_fwd_hdim512_bf16_dequantkv_softcap_packgqa_sm90.cu",
+                                 "instantiations/flash_fwd_hdim512_bf16_dequantkv_split_sm90.cu",
+                                 "instantiations/flash_fwd_hdim512_bf16_dequantkv_split_softcap_sm90.cu"]
     if not DISABLE_HDIMDIFF64:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                              for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)

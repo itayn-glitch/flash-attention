@@ -160,10 +160,14 @@ def get_all_kernels() -> List[Kernel]:
         # The fp8 head-512 path is instead "dequant-on-load -> bf16 MMA" (M5 option 2).
         if sm == 90 and head_dim == 256 and dtype == "bf16":
             yield Kernel(sm=sm, dtype=dtype, head_dim=512, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
-            # M5 dequant-on-load variant (fp8 KV storage -> bf16 compute). Requires the
-            # cp.async paged path (PagedKVNonTMA), so emit only for paged_kv=True.
+            # M5 dequant-on-load variant (fp8 KV storage -> bf16 compute). paged_kv=True is the
+            # deployed cp.async producer (PagedKVNonTMA). M7-TMA adds PagedKVNonTMA=false
+            # instantiations (TMA page-16 producer); dispatch requires PackGQA=true, so emit the
+            # non-paged non-split combo only at the packgqa=True iteration (split ors PackGQA in).
             if paged_kv:
                 yield Kernel(sm=sm, dtype=dtype, head_dim=512, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd", dequant=True)
+            elif (split and not packgqa) or (packgqa and not split):
+                yield Kernel(sm=sm, dtype=dtype, head_dim=512, head_dim_v=512, split=split, paged_kv=False, softcap=softcap, packgqa=packgqa, direction="fwd", dequant=True)
     for dtype, head_dim, softcap, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SOFTCAP, SM):
         yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=False, paged_kv=False, softcap=softcap, packgqa=False, direction="bwd")
 
