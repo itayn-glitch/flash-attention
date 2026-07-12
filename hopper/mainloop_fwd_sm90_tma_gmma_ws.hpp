@@ -358,6 +358,12 @@ struct CollectiveMainloopFwdSm90 {
     // smem size to go from 227KB to 228KB and we get "invalid argument".
 
     struct TensorStorageWithoutPNoTranspose : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose), _0> {
+        // M5 dequant staging (0-byte unless DequantKV). Present here too so the ungated
+        // sK_fp8_stage/sV_fp8_stage lambda bodies compile for the MmaPV_is_RS variant
+        // (they are only *called* under `if constexpr(DequantKV)`). fp8-first to match the
+        // O-overlay ordering of TensorStorageWithPScaleNoTranspose.
+        SmemKFp8_t smem_k_fp8;
+        SmemVFp8_t smem_v_fp8;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVtNoTranspose> smem_v;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
