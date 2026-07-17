@@ -28,8 +28,7 @@ using namespace cute;
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
           bool PackGQA, bool Split, bool V_colmajor, bool Use_one_mma_wg, int kBlockH=1,
-          // M5 dequant-on-load: KV-cache STORAGE dtype. Default == Element (no-op).
-          // Set to e4m3 (Element=bf16) for the head-512 dequant path.
+          // ElementKV is the cache storage type; Element remains the WGMMA compute type.
           typename ElementKV = Element>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr bool DequantKV = !cute::is_same_v<ElementKV, Element>;
@@ -42,28 +41,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using ElementS = cutlass::bfloat16_t;
 
     // Can't use structured binding since it's not compatible with constexpr
-    static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, Use_one_mma_wg);
+    static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, Use_one_mma_wg, DequantKV);
     static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_sm8x(Arch == 86 || Arch == 89, kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKVNonTMA, Varlen && Split, Has_softcap, AppendKV);
     static constexpr int kBlockM = Arch >= 90 ? std::get<0>(kBlockMN_RS_IntraWGOverlap) : std::get<0>(kBlockMN_kNWarps_Stages_RS);
-    // M5 dequant: kBlockN=16 is the ACTIVE/best config (measured 1053-1124us). kBlockN=32 also fits
-    // (the kernel overlays epilogue smem_o onto the fp8 staging via the union -> ~199KB) and is CORRECT,
-    // but measured SLOWER (1935us): with bf16 kStages=1 it was barrier-bound and bigger tiles lengthen
-    // the convert<->MMA ping-pong. kBlockN=16 keeps that gap short. fp8 staging is double-buffered
-    // (kStagesFp8=2); BOTH K and V must be 2-stage or the shared producer WG stalls on DRAM (asymmetric
-    // K2/V1 collapsed to 8726us). bf16/fp8-native paths keep their tuned kBlockN.
-    static constexpr int kBlockN = DequantKV ? 16 : (Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS));
+    static constexpr int kBlockN = Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool MmaPV_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
     static constexpr bool IntraWGOverlap = std::get<3>(kBlockMN_RS_IntraWGOverlap);
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
-    // Square head-512 (kHeadDim>256): 2 stages of K+V must fit H100's 227KB smem.
-    //   bf16 K+V = 2*(64*512*2B) = 128KB/stage -> only 1 stage fits at kBlockN=64 (OQ2 bf16 limit).
-    //   fp8  K+V = 2*(64*512*1B) =  64KB/stage -> 2 stages fit (fp8 is the pipelining enabler).
-    // M5 B3-fast.2: DequantKV runs kBlockN=16, so bf16 K+V 2-stage = 2*(16*512*2B) = 32KB -> fits.
-    // bf16 2-stage lets convert(n+1) overlap MMA(n) (ncu: kStages=1 was 34% CTA-barrier bound from
-    // the convert<->MMA ping-pong on the single bf16 buffer). O/staging union keeps total ~194KB.
-    static constexpr int kStages = Arch >= 90
-        ? (kHeadDim > 256 ? (sizeof(Element) == 1 ? 2 : (DequantKV ? 2 : 1)) : 2)
-        : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
@@ -198,15 +183,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
-    // M5 P2 gate: report exact dynamic smem for this instantiation on demand.
-    if (getenv("FLASH_PRINT_SMEM") != nullptr) {
-        int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
-        int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
-        int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
-        printf("[FLASH_SMEM] total=%d B (%.1f KB, cap 227KB)  q=%d k=%d v=%d  hdim=%d kBlockN=%d kStages=%d DequantKV=%d\n",
-               smem_size, smem_size / 1024.0, smem_size_q, smem_size_k, smem_size_v,
-               (int)CollectiveMainloop::kHeadDim, (int)kBlockN, (int)kStages, (int)DequantKV);
-    }
+    // int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
+    // int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
+    // int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
+    // printf("smem_size = %d, q = %d, k = %d, v = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v);
     // Get the ptr to kernel function.
     if constexpr (size(ClusterShape{}) > 1) {
         void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
@@ -232,6 +212,7 @@ template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool Pag
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
+    static constexpr bool DequantKV = !cute::is_same_v<ElementKV, T>;
     using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
@@ -245,7 +226,8 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                     static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKVNonTMA && !Varlen && !Use_one_mma_wg;
                     QV_SWITCH(params.qv_ptr, HasQV_, [&] {
                         static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_FP8 && kHeadDim == 64 && kHeadDimV >= 256;
-                        APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
+                        APPENDKV_SWITCH(params.knew_ptr && !DequantKV, AppendKV_, [&] {
+                            static constexpr bool AppendKV = AppendKV_ && !DequantKV;
                             // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                             CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                                 static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;

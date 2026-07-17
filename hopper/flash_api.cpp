@@ -100,11 +100,8 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.is_bf16 = q.dtype() == torch::kBFloat16;
     params.is_e4m3 = q.dtype() == torch::kFloat8_e4m3fn;
-    // M5 dequant-on-load: bf16 query + fp8 KV cache. This is the storage-dtype contract —
-    // k/v strides below come from these (fp8) tensors in fp8 element units, so the kernel's
-    // reinterpret_cast<ElementKV*> addresses correct memory. HARD GATE (used in dispatch):
-    // the DequantKV route is taken ONLY when kv_is_fp8 && !is_e4m3 (i.e. q is NOT fp8).
-    params.kv_is_fp8 = (k.dtype() == torch::kFloat8_e4m3fn) && (q.dtype() != torch::kFloat8_e4m3fn);
+    // K/V strides are in storage elements, so mixed BF16/FP8 dispatch must retain the FP8 type.
+    params.kv_is_fp8 = k.dtype() == torch::kFloat8_e4m3fn && q.dtype() == torch::kBFloat16;
 
     // Set the pointers and strides.
     params.q_ptr = q.data_ptr();
@@ -328,19 +325,13 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                                 #endif
                                 #ifndef FLASHATTENTION_DISABLE_HDIM512
-                                // Square head-512 (Gemma4 global). Sm90-only (LargeHeadDimV machinery);
-                                // if constexpr guards the sm80 path from instantiating a 512 symbol.
                                 if constexpr (Arch == 90) {
                                     if (params.d <= 512) {
                                         #ifndef FLASHATTENTION_DISABLE_DEQUANTKV
-                                        // M5 dequant-on-load: bf16 q + fp8 KV cache -> ElementKV=e4m3 instantiation.
-                                        // HARD GATE: only when the KV cache is actually fp8 (contract enforced in
-                                        // set_params_fwd). PagedKVNonTMA (cp.async) is required for the fp8 gather.
                                         if (params.kv_is_fp8 && PagedKVNonTMA) {
-                                            return run_mha_fwd_<90, cutlass::bfloat16_t, 512, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA, cutlass::float_e4m3_t>(params, stream);
+                                            return run_mha_fwd_<90, cutlass::bfloat16_t, 512, 512, Split, PagedKVNonTMA, false, PackGQA, cutlass::float_e4m3_t>(params, stream);
                                         }
                                         #endif
-                                        return run_mha_fwd_<90, cutlass::bfloat16_t, 512, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }
                                 }
                                 #endif
@@ -414,8 +405,6 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             #ifndef FLASHATTENTION_DISABLE_HDIM256
                             if (params.d <= 256) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                             #endif
-                            // NOTE: no e4m3 512 dispatch -- native fp8-MMA at head-512 is blocked
-                            // (fp8 MmaPV=RS vs LargeHeadDimV MmaPV=SS). fp8 head-512 = dequant-on-load.
                             #else
                             TORCH_CHECK(false, "This flash attention build does not support FP8.");
                             #endif
@@ -457,9 +446,9 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
 
 inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
     // disable for local since we move k_ptr to start of sliding window by m_block
-    if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr || params.is_local) { return false; }
+    if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr || params.is_local || params.kv_is_fp8) { return false; }
     // This needs to match the kernel configs
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f, use_one_mma_wg(params));
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f, use_one_mma_wg(params), params.kv_is_fp8);
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     int const kBlockN = std::get<1>(kBlockMN_kernel_args_sm90);
     // Heuristic: when seqlen_q <= kBlockM, we're not compute bound, and somehow using TMA is slower,
@@ -483,7 +472,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // params.page_table must already be set
     if (params.h == params.h_k) { return false; }
     // This needs to match the kernel configs
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params));
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params), params.kv_is_fp8);
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM);
     #endif
@@ -497,7 +486,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // params.page_table must already be set
     // This needs to match the kernel configs
     bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params));
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params), params.kv_is_fp8);
     // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
     // has not been set here. It's OK though because we might just underestimate kBlockN a bit
     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
@@ -510,7 +499,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
         : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + kBlockM));
     int const num_n_blocks = (seqlen_k_loaded + kBlockN - 1) / kBlockN;
     int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
-    int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * (params.is_e4m3 ? 1 : 2);
+    int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * ((params.is_e4m3 || params.kv_is_fp8) ? 1 : 2);
     // Always enable PackGQA for Split
     // If varlen, we use dynamic split, so this heuristic just needs to get an upper bound on num_splits.
     // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
@@ -527,7 +516,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
 }
 
 inline int get_max_headdim() {
-    #ifndef FLASHATTENTION_DISABLE_HDIM512
+    #if !defined(FLASHATTENTION_DISABLE_HDIM512) && !defined(FLASHATTENTION_DISABLE_DEQUANTKV)
     return 512;
     #endif
     #ifndef FLASHATTENTION_DISABLE_HDIM256
@@ -564,7 +553,7 @@ inline int round_up_headdim(int head_size) {
     #ifndef FLASHATTENTION_DISABLE_HDIM256
     if (head_size <= 256) { return 256; }
     #endif
-    #ifndef FLASHATTENTION_DISABLE_HDIM512
+    #if !defined(FLASHATTENTION_DISABLE_HDIM512) && !defined(FLASHATTENTION_DISABLE_DEQUANTKV)
     if (head_size <= 512) { return 512; }
     #endif
     return 256;
@@ -609,12 +598,22 @@ mha_fwd_get_scheduler_metadata(
 
     TORCH_CHECK(qkv_dtype == at::ScalarType::Half || qkv_dtype == at::ScalarType::BFloat16 || qkv_dtype == at::ScalarType::Float8_e4m3fn,
                 "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
+    bool const kv_dequant = headdim > 256;
+    if (kv_dequant) {
+        TORCH_CHECK(qkv_dtype == at::ScalarType::BFloat16, "FP8 KV dequantization requires BF16 query");
+        TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->major == 9, "FP8 KV dequantization is only supported on Hopper");
+        TORCH_CHECK(page_size.has_value(), "FP8 KV dequantization requires a page table");
+        TORCH_CHECK(headdim == 512 && headdim_v == 512, "FP8 KV dequantization requires head dimension 512");
+        TORCH_CHECK(max_seqlen_k_new == 0, "FP8 KV dequantization does not support appending to the KV cache");
+        TORCH_CHECK(!has_softcap, "FP8 KV dequantization does not support softcap");
+    }
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     // Reset the parameters
     Flash_fwd_params params{};
     params.is_bf16 = qkv_dtype == at::ScalarType::BFloat16;
     params.is_e4m3 = qkv_dtype == at::ScalarType::Float8_e4m3fn;
+    params.kv_is_fp8 = kv_dequant;
     params.b = batch_size;
     params.seqlen_q = max_seqlen_q;
     params.seqlen_k = max_seqlen_k;
@@ -718,7 +717,7 @@ mha_fwd_get_scheduler_metadata(
     }
 
     if (use_prepare_varlen) {
-        auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params));
+        auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params), params.kv_is_fp8);
         auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
@@ -789,10 +788,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                     "FlashAttention on Ampere/Ada cards only supports fp16 and bf16 data type");
     }
-    // M5 dequant-on-load: bf16 query + fp8(e4m3) KV cache is allowed (kernel upcasts KV to
-    // bf16 in the load path). Otherwise q/k/v dtypes must match.
     bool const kv_dequant = (k.scalar_type() == at::ScalarType::Float8_e4m3fn) && (q_type == at::ScalarType::BFloat16);
-    TORCH_CHECK(k.scalar_type() == q_type || kv_dequant, "query and key must have the same dtype (or bf16 query + fp8_e4m3 KV for dequant-on-load)");
+    TORCH_CHECK(k.scalar_type() == q_type || kv_dequant, "query and key must have the same dtype, except for BF16 query with FP8 E4M3 paged KV cache");
     TORCH_CHECK(v.scalar_type() == k.scalar_type(), "key and value must have the same dtype");
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
@@ -848,6 +845,20 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     }
     int const max_headdim = get_max_headdim();
     TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
+    if (kv_dequant) {
+        #ifdef FLASHATTENTION_DISABLE_DEQUANTKV
+        TORCH_CHECK(false, "This flash attention build does not support FP8 KV dequantization");
+        #else
+        TORCH_CHECK(dprops->major == 9, "FP8 KV dequantization is only supported on Hopper");
+        TORCH_CHECK(paged_KV, "FP8 KV dequantization requires a page table");
+        TORCH_CHECK(head_size == 512 && head_size_v == 512, "FP8 KV dequantization requires head dimension 512");
+        TORCH_CHECK(!k_new_.has_value(), "FP8 KV dequantization does not support appending to the KV cache");
+        TORCH_CHECK(softcap == 0.f, "FP8 KV dequantization does not support softcap");
+        #endif
+    }
+    if (head_size > 256) {
+        TORCH_CHECK(kv_dequant, "Head dimension above 256 requires BF16 query with FP8 E4M3 paged KV cache");
+    }
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
     if (head_size_v != head_size) {
         TORCH_CHECK((head_size > 128 && head_size <= 192 && head_size_v > 96 && head_size_v <= 128) ||
@@ -1208,7 +1219,6 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         params.lseaccum_head_stride = softmax_lse_accum.stride(-2);
     }
 
-    // M5 dequant-on-load also needs k/v descale wired (q stays bf16 -> q_descale unused).
     if (q_type == at::ScalarType::Float8_e4m3fn || kv_dequant) {
         if (q_descale_.has_value()) {
             auto q_descale = q_descale_.value();

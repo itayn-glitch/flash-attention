@@ -9,14 +9,13 @@
 // Return {kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap}
 constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,
-        bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false, bool use_one_mma_wg=false) {
+        bool v_colmajor=false, bool paged_kv_non_TMA=false, bool softcap=false, bool use_one_mma_wg=false,
+        bool dequant_kv=false) {
     if (element_size == 2) {
         if (headdim > 256) {
-            // Square head-512 (Gemma4 global attention). Not a stock FA3 shape.
-            // LargeHeadDimV (kHeadDimV > 256) forces kBlockM <= 64 and MmaPV_is_RS = false
-            // (mainloop static_asserts). OQ2 de-risk: kBlockN=64 pipelines 2-3 stages within
-            // H100's 228 KB/SM (fp8 KV is the enabler). Conservative start; tuned at M1.
-            return {64, 64, false, false};
+            // FP8 staging makes a small N tile practical while the large-V path requires
+            // a 64-row tile and shared-memory P operand for the PV WGMMA.
+            return {64, dequant_kv ? 16 : 64, false, false};
         }
         if (headdim <= 64) {
             // return {same_hdim ? 192 : 64, same_hdim ? 128 : 64, same_hdim, same_hdim};
@@ -59,12 +58,6 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         }
     } else {
         // FP8 path
-        if (headdim > 256) {
-            // Square head-512 fp8 (Gemma4 global). LargeHeadDimV forces kBlockM<=64 and
-            // MmaPV_is_RS=false; fp8 K+V is 1B so 2 stages fit in 228KB (kStages set in
-            // the launch template by element size). OQ2 fp8 enabler path.
-            return {64, 64, false, false};
-        }
         if (use_one_mma_wg) {
             // Decode tiles — independent of two-level accumulation setting
             if (headdim <= 96) {

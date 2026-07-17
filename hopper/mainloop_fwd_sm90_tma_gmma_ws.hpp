@@ -31,10 +31,8 @@ using namespace cute;
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
         bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_, int kBlockH_=1,
-        // ElementKV = KV-cache STORAGE/load dtype, decoupled from Element (the MMA compute
-        // dtype). Default == Element (no-op). Set to e4m3 with Element=bf16 for the head-512
-        // "dequant-on-load" path (M5 option 2): read 1-byte fp8 from HBM, upcast->bf16 in the
-        // producer, keep bf16 wgmma (so MmaPV=SS / LargeHeadDimV stays valid, unlike native fp8).
+        // ElementKV is the cache storage type and Element is the WGMMA compute type. Separating
+        // them preserves the shared-memory P path required by large V dimensions.
         class ElementKV_ = Element_>
 struct CollectiveMainloopFwdSm90 {
 
@@ -42,12 +40,8 @@ struct CollectiveMainloopFwdSm90 {
     using ClusterShape = ClusterShape_;
     using TileShape_MNK = TileShape_MNK_;
     using ElementKV = ElementKV_;
-    static constexpr bool DequantKV = !cute::is_same_v<ElementKV, Element_>;  // fp8 storage, bf16 compute
-    // M5 B3-fast.2 pipeline (DequantKV, kBlockN=16): load -> convert -> MMA, each double-buffered.
-    //   - bf16 target pipeline: kStages=2 (set in launch template) so convert(n+1) overlaps MMA(n).
-    //   - fp8 STAGING pipeline: kStagesFp8=3 so the cp.async load runs 2 blocks ahead of the convert
-    //     (hides DRAM latency). FREE up to 4: the epilogue-smem_o union overlays the staging, so extra
-    //     staging fills the previously-wasted O-alignment padding at zero total-smem cost (stays 196KB).
+    static constexpr bool DequantKV = !cute::is_same_v<ElementKV, Element_>;
+    // A deeper storage pipeline keeps cp.async ahead of conversion and BF16 WGMMA.
     static constexpr int kStagesFp8 = DequantKV ? 3 : kStages;
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
@@ -70,6 +64,10 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
     static constexpr bool Use_TMA_Q = !PackGQA || PackGQA_TMA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
+    static_assert(!DequantKV || cute::is_same_v<ElementKV, cutlass::float_e4m3_t>);
+    static_assert(!DequantKV || cute::is_same_v<Element, cutlass::bfloat16_t>);
+    static_assert(!DequantKV || PagedKVNonTMA);
+    static_assert(!DequantKV || !AppendKV);
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
@@ -181,10 +179,8 @@ struct CollectiveMainloopFwdSm90 {
         SmemLayoutAtomVCpAsync{},
         make_shape(shape<1>(TileShape_MNK{}), Int<kHeadDimV>{}, Int<kStages>{})));
 
-    // M5 dequant-on-load (Path B): fp8 STAGING layouts, typed by ElementKV (1 byte).
-    // The cp.async producer gathers fp8 KV into these, then a vectorized convert upcasts
-    // into the bf16 smem_k/smem_v the wgmma consumes (consumer unchanged). Swizzle atom
-    // is selected for ElementKV (fp8) so cp.async stores land bank-conflict-free.
+    // The storage-type swizzle keeps the paged cp.async gather bank-conflict-free before
+    // conversion into the compute-type K/V layouts consumed by WGMMA.
     using SmemLayoutAtomKFp8 = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementKV,
         decltype(cute::get<1>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutKFp8 = decltype(tile_to_shape(
@@ -326,8 +322,7 @@ struct CollectiveMainloopFwdSm90 {
     // We always use TMA for K_new and V_new
     using MainloopPipelineKVNew = PipelineTmaAsync;
     using PipelineState = cutlass::PipelineState<kStages>;
-    // M5 B3-fast.2: fp8 staging pipelines (cp.async -> fp8 smem, consumed by the producer-WG
-    // convert stage). Always PipelineAsync (DequantKV is a cp.async/paged path). Own stage count.
+    // The load warp group consumes these cp.async stages during conversion.
     using MainloopPipelineKFp8 = cutlass::PipelineAsync<kStagesFp8>;
     using MainloopPipelineVFp8 = cutlass::PipelineAsync<kStagesFp8>;
     using PipelineStateFp8 = cutlass::PipelineState<kStagesFp8>;
@@ -346,13 +341,9 @@ struct CollectiveMainloopFwdSm90 {
     using SmemP_t = std::conditional_t<MmaPV_is_RS, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutP>, SmemAlignmentP>>;
     using SmemScale_t = std::conditional_t<!LargeHeadDimV, cute::array<float, 0>, cute::array_aligned<float, cute::cosize_v<SmemLayoutScale>, 128>>;
     using SmemQv_t = std::conditional_t<!HasQv, cute::array<Element, 0>, cute::array_aligned<Element, cute::cosize_v<SmemLayoutQv>, SmemAlignmentQv>>;
-    // M5 dequant fp8 staging buffers: real size only when DequantKV, else truly 0-byte
-    // (same zero-size idiom as SmemP_t/SmemQv_t so the bf16 build is byte-identical).
-    using SmemKFp8_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutKFp8>, 128>, cute::array<ElementKV, 0>>;
-    using SmemVFp8_t = std::conditional_t<DequantKV, cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutVFp8>, 128>, cute::array<ElementKV, 0>>;
-    // M5 B3-fast.2 kBlockN=32 fit: bytes of fp8 staging (placed first in TensorStorage). The kernel
-    // overlays the epilogue smem_o onto this region (staging is mainloop-transient, O is epilogue-
-    // transient -> never live together), reclaiming the ~32KB the smem_v-overlay would waste.
+    using SmemKFp8_t = cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutKFp8>, 128>;
+    using SmemVFp8_t = cute::array_aligned<ElementKV, cute::cosize_v<SmemLayoutVFp8>, 128>;
+    // The epilogue uses this size to overlay smem_o on staging after the mainloop finishes.
     static constexpr int SmemKVFp8Bytes = DequantKV ? int(sizeof(SmemKFp8_t) + sizeof(SmemVFp8_t)) : 0;
     // Sometimes even with SmemP_t = cute::array<Element, 0>, putting it in the TensorStorage struct causes
     // smem size to go from 227KB to 228KB and we get "invalid argument".
@@ -374,10 +365,17 @@ struct CollectiveMainloopFwdSm90 {
         cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
     struct TensorStorageWithPScaleNoTranspose : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP), _0> {
-        // M5 B3-fast.2 kBlockN=32 fit: fp8 staging FIRST (offset 0) so the epilogue smem_o overlays it
-        // via the SharedStorage union (both transient, never simultaneously live). 0-byte when
-        // !DequantKV -> no-op there (smem_v stays effectively first, O overlays smem_v as before).
-        SmemKFp8_t smem_k_fp8;  // M5 dequant staging (0-byte unless DequantKV)
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVtNoTranspose> smem_v;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
+        SmemQv_t smem_qv;
+        SmemP_t smem_p;
+        SmemScale_t smem_scale;
+        cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
+    };
+    struct TensorStorageWithPScaleNoTransposeDequant : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentVtNoTranspose, SmemAlignmentP), _0> {
+        // Staging comes first so the epilogue union can reclaim it for smem_o.
+        SmemKFp8_t smem_k_fp8;
         SmemVFp8_t smem_v_fp8;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>, SmemAlignmentVtNoTranspose> smem_v;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
@@ -391,7 +389,8 @@ struct CollectiveMainloopFwdSm90 {
     using TensorStorageNoTranspose = std::conditional_t<
         MmaPV_is_RS,
         TensorStorageWithoutPNoTranspose,
-        std::conditional_t<!LargeHeadDimV, TensorStorageWithPNoTranspose, TensorStorageWithPScaleNoTranspose>
+        std::conditional_t<!LargeHeadDimV, TensorStorageWithPNoTranspose,
+                           std::conditional_t<DequantKV, TensorStorageWithPScaleNoTransposeDequant, TensorStorageWithPScaleNoTranspose>>
     >;
 
     static constexpr size_t SmemAlignmentVt = cutlass::detail::alignment_for_swizzle(SmemLayoutVt{});
@@ -660,14 +659,14 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-    template <typename SchedulerPrefetch, typename SharedStorage>
+    template <typename MainloopPipelineKFp8_, typename MainloopPipelineVFp8_, typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
          MainloopPipelineK pipeline_k,
          MainloopPipelineV pipeline_v,
          MainloopPipelineVt pipeline_vt,
-         MainloopPipelineKFp8 pipeline_k_fp8,
-         MainloopPipelineVFp8 pipeline_v_fp8,
+         MainloopPipelineKFp8_ pipeline_k_fp8,
+         MainloopPipelineVFp8_ pipeline_v_fp8,
          PipelineState& smem_pipe_write,
          PipelineStateFp8& smem_pipe_write_fp8,
          SharedStorage &shared_storage,
@@ -725,10 +724,6 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
 
-        // M5 B4 reversal: the fp8->bf16 convert is PURE (descale is applied in the CONSUMER math --
-        // k_descale into pre-softmax scores, v_descale in finalize -- see mma()). No descale is loaded
-        // or applied in the producer here anymore.
-
         // Prepare the TMA loads
         uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
@@ -781,9 +776,7 @@ struct CollectiveMainloopFwdSm90 {
         // This is used to index into the batch dimension of mK and mV
         int const bidb_kv_idx = !is_varlen_k && !params.ptr_pagetable ? bidb_kv : 0;
 
-        // M5 dequant: the paged manager gathers the KV cache in its STORAGE dtype
-        // (ElementKV = fp8 when DequantKV) into the fp8 staging smem; the producer then
-        // upcasts to bf16. When !DequantKV, PagedKVElement == Element (unchanged).
+        // Paged addresses and strides are expressed in the cache storage type.
         using PagedKVElement = std::conditional_t<DequantKV, ElementKV, Element>;
         using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, PagedKVElement, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/>;
         PagedKVManager_t paged_kv_manager(
@@ -841,36 +834,23 @@ struct CollectiveMainloopFwdSm90 {
             }
         }
 
-        // M5 dequant (B3-simple, correctness-first): upcast one fp8 staging stage -> bf16
-        // smem, descale folded per-element. Element-wise over the logical domain (swizzle-safe:
-        // linear index maps through each tensor's own layout). Vectorize (fp8x4->bf16x2) later.
-        // All fp8-staging tensors are constructed INSIDE these gated branches so the bf16
-        // build (DequantKV=false) never instantiates a view over the 0-size staging array.
-        // B3-fast: VECTORIZED convert via CuTe tiled copies (swizzle-safe -- NOT a raw fp8x4 cast,
-        // since fp8/bf16 use different swizzle atoms). Partition fp8 src & bf16 dst with the SAME
-        // thread/value layout over the (kBlockN,kHeadDim) tile so per-thread elements map to the
-        // same logical positions; vectorized LDS fp8->regs, convert+descale in regs, vectorized STS.
-        // val=16 elems: fp8 16=128b LDS (vs 2x64b at val=8), bf16 16=2x128b STS. Halves the producer's
-        // smem-load instruction count -> shorter convert -> less barrier wait (ncu was 33% CTA-barrier).
-        // thr=(kBlockN, NumProducerThreads/kBlockN).
-        // B4 reversal: PURE fp8->bf16 convert (lossless: bf16 mantissa 8b >= fp8 3b). Descale is applied
-        // in the CONSUMER math (k_descale into pre-softmax scores, v_descale in finalize -- see mma()),
-        // off the producer critical path (measured -6% barrier stall vs folding descale here).
+        // Source and destination copies share a logical thread/value layout because their swizzles
+        // differ. Descale stays in consumer math, leaving this conversion lossless and vectorized.
         auto convert_tile = [&] (auto&& sf, auto&& sb) {
-          if constexpr (DequantKV) {   // gate: NumProducerThreads/kBlockN is degenerate on the non-dequant TMA path
-            auto thr_l = Layout<Shape<Int<kBlockN>, Int<NumProducerThreads / kBlockN>>>{};
-            auto val_l = Layout<Shape<_1, _16>>{};
-            auto tcf = make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementKV>{}, thr_l, val_l);
-            auto tcb = make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{}, thr_l, val_l);
-            Tensor tsf = tcf.get_thread_slice(thread_idx).partition_S(sf);
-            Tensor tsb = tcb.get_thread_slice(thread_idx).partition_D(sb);
-            Tensor rf = make_fragment_like(tsf);
-            Tensor rb = make_fragment_like(tsb);
-            cute::copy(tcf, tsf, rf);
-            CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < size(rf); ++j) { rb(j) = static_cast<Element>(float(rf(j))); }
-            cute::copy(tcb, rb, tsb);
-          }
+            if constexpr (DequantKV) {
+                auto thr_l = Layout<Shape<Int<kBlockN>, Int<NumProducerThreads / kBlockN>>>{};
+                auto val_l = Layout<Shape<_1, _16>>{};
+                auto tcf = make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementKV>{}, thr_l, val_l);
+                auto tcb = make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{}, thr_l, val_l);
+                Tensor tsf = tcf.get_thread_slice(thread_idx).partition_S(sf);
+                Tensor tsb = tcb.get_thread_slice(thread_idx).partition_D(sb);
+                Tensor rf = make_fragment_like(tsf);
+                Tensor rb = make_fragment_like(tsb);
+                cute::copy(tcf, tsf, rf);
+                CUTLASS_PRAGMA_UNROLL
+                for (int j = 0; j < size(rf); ++j) { rb(j) = static_cast<Element>(float(rf(j))); }
+                cute::copy(tcb, rb, tsb);
+            }
         };
         auto convert_K_stage = [&] (int fp8_stage, int bf16_stage) {
             if constexpr (DequantKV) {
@@ -884,19 +864,7 @@ struct CollectiveMainloopFwdSm90 {
                 convert_tile(sVf, sVcpasync(_, _, bf16_stage));
             }
         };
-        // fp8 staging targets for the paged cp.async loads (also gated).
-        auto sK_fp8_stage = [&] (int stage) {
-            return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k_fp8.data()), SmemLayoutKFp8{}))(_, _, stage);
-        };
-        auto sV_fp8_stage = [&] (int stage) {
-            return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_fp8.data()), SmemLayoutVFp8{}))(_, _, stage);
-        };
-
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
-            // NOTE: producer_acquire is per-branch: the DequantKV route acquires the fp8 STAGING
-            // pipeline (smem_pipe_write is the fp8 state there), NOT the bf16 pipeline_k -- the bf16
-            // pipeline is acquired later, in convert_KV. Acquiring pipeline_k here would double-acquire
-            // and mistype the state (PipelineStateFp8 vs PipelineState).
             if constexpr (!PagedKVNonTMA) {
                 pipeline_k.producer_acquire(smem_pipe_write);
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
@@ -905,10 +873,9 @@ struct CollectiveMainloopFwdSm90 {
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
                 if constexpr (DequantKV) {
-                    // async cp.async fp8 -> fp8 STAGING pipeline (kStagesFp8), no wait/convert here
-                    // (the convert stage runs one block behind so this load stays in flight).
+                    Tensor sKf = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k_fp8.data()), SmemLayoutKFp8{}));
                     pipeline_k_fp8.producer_acquire(smem_pipe_write);
-                    paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_fp8_stage(smem_pipe_write.index()));
+                    paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sKf(_, _, smem_pipe_write.index()));
                     pipeline_k_fp8.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
                 } else {
                     pipeline_k.producer_acquire(smem_pipe_write);
@@ -919,7 +886,6 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         auto load_V = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
-            // producer_acquire is per-branch (see load_K): DequantKV acquires the fp8 STAGING pipeline.
             if constexpr (!PagedKVNonTMA) {
                 auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
                 pipeline_v_load.producer_acquire(smem_pipe_write);
@@ -929,9 +895,9 @@ struct CollectiveMainloopFwdSm90 {
             } else {
                 constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
                 if constexpr (DequantKV) {
-                    // async cp.async fp8 -> fp8 STAGING pipeline. smem_pipe_write == fp8 write-state.
+                    Tensor sVf = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v_fp8.data()), SmemLayoutVFp8{}));
                     pipeline_v_fp8.producer_acquire(smem_pipe_write);
-                    paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sV_fp8_stage(smem_pipe_write.index()));
+                    paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sVf(_, _, smem_pipe_write.index()));
                     pipeline_v_fp8.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
                 } else {
                     auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
@@ -959,11 +925,7 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_vt.consumer_release(smem_pipe_read);
         };
 
-        // B3-fast.2 DequantKV convert stage (mirrors copy_Vt_to_V): the producer WG consumes one fp8
-        // staging stage (K and V), upcasts+descales -> the bf16 pipeline the MMA WG reads. Runs one
-        // block behind the fp8 load so the next block's cp.async stays in flight during convert+MMA.
-        // `fp8_write` is the fp8 producer-state used when this block was loaded; reconstruct the
-        // consumer read-state from it (phase^1) exactly as copy_Vt_to_V does for pipeline_vt.
+        // Conversion trails the storage load by one block so the next cp.async stays in flight.
         auto convert_KV = [&] (auto const& fp8_write, auto const& bf16_write) {
             if constexpr (DequantKV) {
                 PipelineStateFp8 fp8_read{fp8_write.index(), fp8_write.phase() ^ 1, fp8_write.count()};
@@ -1030,11 +992,7 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         if constexpr (DequantKV) {
-            // ---- B3-fast.2: software-pipelined fp8 dequant load ----
-            // Load block n's fp8 K & V (into fp8 staging, kStagesFp8=2) via async cp.async, then convert
-            // the PREVIOUS block fp8->bf16 into the bf16 pipeline (kStages=2, so convert(n+1) overlaps MMA(n)).
-            // The convert runs one block behind the load, so block n's cp.async stays in flight while
-            // block n+1 is converted+consumed -> DRAM load overlaps convert+MMA (the missing overlap).
+            // Load FP8 K/V ahead of conversion to overlap cache reads with BF16 WGMMA.
             if (should_load_KV) {
                 paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
             }
@@ -1124,10 +1082,10 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-    template <typename SharedStorage>
+    template <typename MainloopPipelineKFp8_, typename MainloopPipelineVFp8_, typename SharedStorage>
     CUTLASS_DEVICE void
     load_tail(MainloopPipelineK pipeline_k, MainloopPipelineV pipeline_v, MainloopPipelineVt pipeline_vt,
-              MainloopPipelineKFp8 pipeline_k_fp8, MainloopPipelineVFp8 pipeline_v_fp8,
+              MainloopPipelineKFp8_ pipeline_k_fp8, MainloopPipelineVFp8_ pipeline_v_fp8,
               PipelineState& smem_pipe_write, PipelineStateFp8& smem_pipe_write_fp8,
               SharedStorage &shared_storage, int const work_idx) {
         // If we don't wait for barrier_O here, when using Cluster, CTA0 might exit early and CTA1 will
@@ -1313,9 +1271,7 @@ struct CollectiveMainloopFwdSm90 {
             float const k_descale = params.ptr_k_descale == nullptr ? 1.0f : params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)];
             softcap_val *= q_descale * k_descale;
         }
-        // M5 B4 reversal: for DequantKV the fp8->bf16 convert is pure (no descale), so k_descale is
-        // folded into the raw scores here (exact: score = k_descale * (Q . fp8_K)). q stays bf16.
-        // With softcap it folds into softcap_val (like Is_FP8); without softcap, multiply scores below.
+        // Folding K descale into scores avoids scaling every converted K element.
         float k_descale_dq = 1.0f;
         if constexpr (DequantKV) {
             k_descale_dq = params.ptr_k_descale == nullptr ? 1.0f : params.ptr_k_descale[bidb * get<0>(params.stride_k_descale) + bidh_kv * get<1>(params.stride_k_descale)];
@@ -1541,7 +1497,6 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
             flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
             float const v_descale = !(Is_FP8 || DequantKV) || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
-            // cute::copy(softmax.finalize(v_descale), scores_scale);
             finalize_dispatch(scores_scale, v_descale);
             if constexpr (LargeHeadDimV) {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
@@ -1644,7 +1599,6 @@ struct CollectiveMainloopFwdSm90 {
             // Tell producers that smem_q is ready
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             float const v_descale = !(Is_FP8 || DequantKV) || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
-            // Tensor scores_scale = softmax.finalize(v_descale);
             Tensor scores_scale = make_tensor_like(softmax.row_max);
             finalize_dispatch(scores_scale, v_descale);
             

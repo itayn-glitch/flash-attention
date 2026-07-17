@@ -1,0 +1,11 @@
+// Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+// Splitting the different template instantiations to different files to speed up compilation.
+// This file is auto-generated. See "generate_kernels.py"
+
+#include "flash_fwd_launch_template.h"
+
+#ifndef FLASHATTENTION_DISABLE_HDIM512
+#ifndef FLASHATTENTION_DISABLE_DEQUANTKV
+template void run_mha_fwd_<90, cutlass::bfloat16_t, 512, 512, true, true, false, true, cutlass::float_e4m3_t>(Flash_fwd_params &params, cudaStream_t stream);
+#endif
+#endif

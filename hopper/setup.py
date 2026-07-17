@@ -61,13 +61,13 @@ DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
-# Square head-512 (Gemma4 global). DEFAULT-DISABLED: only the base bf16 512 fwd shape is
-# M1-validated; the split/paged/softcap 512 variants are unvalidated until M2+. Opt in with
-# FLASH_ATTENTION_DISABLE_HDIM512=FALSE (build_m1.sh does this).
-DISABLE_HDIM512 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM512", "TRUE") == "TRUE"
-# M5 dequant-on-load (fp8 KV storage -> bf16 compute) head-512. DEFAULT-DISABLED (opt-in,
-# like HDIM512); build_m5.sh sets FALSE. Requires HDIM512 enabled + PagedKV (cp.async path).
-DISABLE_DEQUANTKV = os.getenv("FLASH_ATTENTION_DISABLE_DEQUANTKV", "TRUE") == "TRUE"
+DISABLE_HDIM512 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM512", "FALSE") == "TRUE"
+DISABLE_DEQUANTKV = (
+    os.getenv("FLASH_ATTENTION_DISABLE_DEQUANTKV", "FALSE") == "TRUE"
+    or DISABLE_HDIM512
+    or DISABLE_FP8
+    or DISABLE_PAGEDKV
+)
 DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
@@ -435,11 +435,7 @@ if not SKIP_CUDA_BUILD:
     # ptxas 12.8 gives the best perf currently
     # We want to use the nvcc front end from 12.6 however, since if we use nvcc 12.8
     # Cutlass 3.8 will expect the new data types in cuda.h from CTK 12.8, which we don't have.
-    # FLASH_ATTENTION_USE_SYSTEM_CTK=1 uses the system CUDA toolkit (CUDA_HOME) as-is
-    # instead of downloading the pinned nvcc 12.6 / ptxas 12.8. Needed when torch is built
-    # against a newer CTK (e.g. cu130): the pinned 12.x nvcc would trip torch's CUDA
-    # version check, so we compile with the matching system toolkit.
-    if bare_metal_version != Version("12.8") and not check_env_flag("FLASH_ATTENTION_USE_SYSTEM_CTK", ""):
+    if bare_metal_version != Version("12.8"):
         download_and_copy(
             name="nvcc",
             src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin",
@@ -568,17 +564,9 @@ if not SKIP_CUDA_BUILD:
     #                     for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
     #                     if not (packgqa and (paged or split))]
     if not DISABLE_HDIM512:
-        # Square head-512 (Gemma4 global): bf16 only. Native fp8-MMA e4m3 512 does not compile
-        # (fp8 needs MmaPV RS, LargeHeadDimV needs MmaPV SS) -- fp8 head-512 is dequant-on-load.
-        sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim512_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
-                             for dtype, split, paged, softcap, packgqa in itertools.product(["bf16"], SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
-                             if not (packgqa and (paged or split)) and (not PACKGQA_ONLY or packgqa or paged or split)]
         if not DISABLE_DEQUANTKV and not DISABLE_PAGEDKV:
-            # M5 dequant-on-load 512 (fp8 KV storage). Emitted only for paged (cp.async) — see
-            # generate_kernels, which filters raw packgqa=True when paged, so no _packgqa suffix
-            # (the instantiation's actual PackGQA arg is still true via packgqa|paged|split).
-            sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim512_bf16_dequantkv_paged{split}{softcap}_sm90.cu"
-                                 for split, softcap in itertools.product(SPLIT, SOFTCAP)]
+            sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim512_bf16_dequantkv_paged{split}_sm90.cu"
+                                 for split in SPLIT]
     if not DISABLE_HDIMDIFF64:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                              for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)

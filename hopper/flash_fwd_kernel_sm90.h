@@ -93,9 +93,7 @@ public:
     // Kernel level shared memory storage
     // We overlap the shared memory for the mainloop and epilogue. However, we only want smem_o to overlap with smem_v
     // and nothing else, so we'll pad in case sizeof(smem_o) > sizeof(smem_v).
-    // The epilogue smem_o overlays the START of the mainloop TensorStorage. For DequantKV the fp8
-    // staging is placed first and O overlays IT (staging is mainloop-transient, O epilogue-transient),
-    // so the padding keys off the staging bytes (== O -> padding 0). Otherwise O overlays smem_v.
+    // FP8 staging is no longer live when the epilogue starts, so smem_o can overlay it.
     static constexpr int epilogue_overlay_bytes = CollectiveMainloop::DequantKV
         ? CollectiveMainloop::SmemKVFp8Bytes
         : int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)));
@@ -113,18 +111,27 @@ public:
             };
         } tensors;
         struct PipelineStorage : cute::aligned_struct<16, _1> {
+            using Fp8PipelineKStorage = std::conditional_t<CollectiveMainloop::DequantKV,
+                typename CollectiveMainloop::MainloopPipelineKFp8::SharedStorage, cute::array<uint8_t, 0>>;
+            using Fp8PipelineVStorage = std::conditional_t<CollectiveMainloop::DequantKV,
+                typename CollectiveMainloop::MainloopPipelineVFp8::SharedStorage, cute::array<uint8_t, 0>>;
             alignas(16) BarrierQ barrier_Q;
             alignas(16) BarrierQ barrier_Qv;
             alignas(16) cutlass::arch::ClusterBarrier barrier_O;
             alignas(16) typename CollectiveMainloop::MainloopPipelineK::SharedStorage pipeline_k;
             alignas(16) typename CollectiveMainloop::MainloopPipelineV::SharedStorage pipeline_v;
             alignas(16) typename CollectiveMainloop::MainloopPipelineVt::SharedStorage pipeline_vt;
-            alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_k_new;
-            alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
-            // M5 B3-fast.2: fp8 staging pipelines (mbarriers only; the fp8 smem buffers live in
-            // TensorStorage). Tiny; present unconditionally (DequantKV=false => same as bf16 stages).
-            alignas(16) typename CollectiveMainloop::MainloopPipelineKFp8::SharedStorage pipeline_k_fp8;
-            alignas(16) typename CollectiveMainloop::MainloopPipelineVFp8::SharedStorage pipeline_v_fp8;
+            union {
+                struct {
+                    alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_k_new;
+                    alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
+                } append_kv;
+                // Dequantization and append-KV are mutually exclusive, so their barriers can overlap.
+                struct {
+                    alignas(16) Fp8PipelineKStorage pipeline_k_fp8;
+                    alignas(16) Fp8PipelineVStorage pipeline_v_fp8;
+                } dequant_kv;
+            };
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
@@ -253,14 +260,7 @@ public:
             pipeline_params_vt.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
             if constexpr (LargeHeadDimV) { pipeline_params_vt.num_consumers = NumMmaThreads; }
         } else {
-            // Square large-headdim-V (kHeadDim == kHeadDimV > 256, e.g. Gemma4 head-512):
-            // Vt shares K's TMA pipeline params (SameHeadDim => same transaction bytes as K),
-            // which expose num_consumers, not the cp.async-only consumer_arv_count. Select the
-            // member matching the params type. (Stock FA3 only had kHeadDim < kHeadDimV here.)
-            if constexpr (LargeHeadDimV) {
-                if constexpr (Use_TMA_KV) { pipeline_params_vt.num_consumers = NumMmaThreads; }
-                else { pipeline_params_vt.consumer_arv_count = NumMmaThreads; }
-            }
+            if constexpr (LargeHeadDimV) { pipeline_params_vt.consumer_arv_count = NumMmaThreads; }
         }
 
         MainloopPipelineK pipeline_k = [&] {
@@ -304,16 +304,33 @@ public:
             }
         }();
 
-        // M5 B3-fast.2: fp8 staging pipelines (cp.async). Producer = load WG (WG0); the same WG0 is
-        // also the consumer (the convert stage). Only WG0 touches them, so arv counts = NumProducerThreads.
-        typename MainloopPipelineKFp8::Params pipeline_params_fp8;
-        pipeline_params_fp8.role = warp_group_idx == 0
-            ? MainloopPipelineKFp8::ThreadCategory::Producer
-            : MainloopPipelineKFp8::ThreadCategory::Consumer;
-        pipeline_params_fp8.producer_arv_count = NumProducerThreads;
-        pipeline_params_fp8.consumer_arv_count = NumProducerThreads;
-        MainloopPipelineKFp8 pipeline_k_fp8(shared_storage.pipelines.pipeline_k_fp8, pipeline_params_fp8);
-        MainloopPipelineVFp8 pipeline_v_fp8(shared_storage.pipelines.pipeline_v_fp8, pipeline_params_fp8);
+        auto pipeline_k_fp8 = [&] {
+            if constexpr (DequantKV) {
+                // The load warp group both produces and converts the staged FP8 values.
+                typename MainloopPipelineKFp8::Params pipeline_params_fp8;
+                pipeline_params_fp8.role = warp_group_idx == 0
+                    ? MainloopPipelineKFp8::ThreadCategory::Producer
+                    : MainloopPipelineKFp8::ThreadCategory::Consumer;
+                pipeline_params_fp8.producer_arv_count = NumProducerThreads;
+                pipeline_params_fp8.consumer_arv_count = NumProducerThreads;
+                return MainloopPipelineKFp8(shared_storage.pipelines.dequant_kv.pipeline_k_fp8, pipeline_params_fp8);
+            } else {
+                return nullptr;
+            }
+        }();
+        auto pipeline_v_fp8 = [&] {
+            if constexpr (DequantKV) {
+                typename MainloopPipelineVFp8::Params pipeline_params_fp8;
+                pipeline_params_fp8.role = warp_group_idx == 0
+                    ? MainloopPipelineVFp8::ThreadCategory::Producer
+                    : MainloopPipelineVFp8::ThreadCategory::Consumer;
+                pipeline_params_fp8.producer_arv_count = NumProducerThreads;
+                pipeline_params_fp8.consumer_arv_count = NumProducerThreads;
+                return MainloopPipelineVFp8(shared_storage.pipelines.dequant_kv.pipeline_v_fp8, pipeline_params_fp8);
+            } else {
+                return nullptr;
+            }
+        }();
 
         PipelineParamsKVNew pipeline_params_kv_new;
         pipeline_params_kv_new.role = warp_group_idx == 0
@@ -322,11 +339,11 @@ public:
         pipeline_params_kv_new.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
         pipeline_params_kv_new.is_leader = warp_group_thread_idx == 0;
         pipeline_params_kv_new.num_consumers = NumMmaThreads;
-        auto pipeline_k_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_k_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
+        auto pipeline_k_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.append_kv.pipeline_k_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
         if constexpr (!SameHeadDim) {
             pipeline_params_kv_new.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
         }
-        auto pipeline_v_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_v_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
+        auto pipeline_v_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.append_kv.pipeline_v_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
 
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;

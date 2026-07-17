@@ -725,6 +725,7 @@ def flash_attn_with_kvcache(
             page_block_size must be a multiple of 256.
         v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v) if there's no page_table,
             or (num_blocks, page_block_size, nheads_k, headdim_v) if there's a page_table (i.e. paged KV cache)
+            Hopper head-dim 512 supports BF16 q with paged FP8 E4M3 k_cache and v_cache.
         k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
             k with k_cache, starting at the indices specified by cache_seqlens.
         v [optional]: (batch_size, seqlen_new, nheads_k, headdim_v). Similar to k.
@@ -740,6 +741,8 @@ def flash_attn_with_kvcache(
                  might come from any of the duplicate indices.
         cache_leftpad: (batch_size,), dtype torch.int32. The index that the KV cache starts. If None, assume 0.
         page_table [optional]: (batch_size, max_num_blocks_per_seq), dtype torch.int32.
+        k_descale [optional]: (batch_size, nheads_k), dtype float32. Per-cache-head FP8 K descale.
+        v_descale [optional]: (batch_size, nheads_k), dtype float32. Per-cache-head FP8 V descale.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).

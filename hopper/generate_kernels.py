@@ -42,7 +42,6 @@ template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {
 #endif
 """
 
-# M5 dequant-on-load: bf16 compute (T) + fp8 (e4m3) KV STORAGE. Trailing ElementKV param.
 KERNEL_IMPL_TEMPLATE_FWD_SM90_DEQUANT = """#include "flash_fwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
@@ -101,7 +100,7 @@ class Kernel:
     softcap: bool
     packgqa: bool
     direction: str
-    dequant: bool = False  # M5: fp8 KV storage + bf16 compute (ElementKV=e4m3)
+    dequant: bool = False
 
     @property
     def template(self) -> str:
@@ -153,16 +152,10 @@ def get_all_kernels() -> List[Kernel]:
         if sm == 90 and head_dim == 64 and dtype in ["bf16", "fp16"]:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=256, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
-        # Square head-512 (Gemma4 global attention): QK-512 instantiation absent from stock FA3.
-        # Piggyback the hdim==256 iteration so we emit one 512/512 kernel per feature combo.
-        # bf16 ONLY: native fp8-MMA (e4m3) at head-512 is architecturally blocked in FA3 --
-        # fp8 requires MmaPV_is_RS=true but LargeHeadDimV (kHeadDimV>256) requires MmaPV SS.
-        # The fp8 head-512 path is instead "dequant-on-load -> bf16 MMA" (M5 option 2).
+        # Native FP8 MMA requires register-sourced P, while the large-V path requires
+        # shared-memory P. Store paged K/V as FP8 and convert them before BF16 WGMMA instead.
         if sm == 90 and head_dim == 256 and dtype == "bf16":
-            yield Kernel(sm=sm, dtype=dtype, head_dim=512, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
-            # M5 dequant-on-load variant (fp8 KV storage -> bf16 compute). Requires the
-            # cp.async paged path (PagedKVNonTMA), so emit only for paged_kv=True.
-            if paged_kv:
+            if paged_kv and not softcap:
                 yield Kernel(sm=sm, dtype=dtype, head_dim=512, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd", dequant=True)
     for dtype, head_dim, softcap, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SOFTCAP, SM):
         yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=False, paged_kv=False, softcap=softcap, packgqa=False, direction="bwd")
@@ -173,7 +166,7 @@ def batch_hdim(kernels_all) -> List[KERNEL_BATCH]:
         if sm < 90:
             continue
         # Same hdim and hdimv
-        kernels = [k for k in kernels_all if k.direction == "fwd" and k.dtype == dtype and k.split == split and k.paged_kv == paged_kv and k.softcap == softcap and k.packgqa == packgqa and k.sm == sm and k.head_dim == k.head_dim_v]
+        kernels = [k for k in kernels_all if k.direction == "fwd" and not k.dequant and k.dtype == dtype and k.split == split and k.paged_kv == paged_kv and k.softcap == softcap and k.packgqa == packgqa and k.sm == sm and k.head_dim == k.head_dim_v]
         if len(kernels) > 0:
             filename = f"flash_fwd_hdimall_{dtype}{'_paged' if paged_kv else ''}{'_split' if split else ''}{'_softcap' if softcap else ''}{'_packgqa' if packgqa else ''}_sm{sm}.cu"
             template = "\n".join([f"#include \"{k.filename}\"" for k in kernels])
