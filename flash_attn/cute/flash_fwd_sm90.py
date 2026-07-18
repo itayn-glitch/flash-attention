@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from typing import Callable, Literal, Optional
 from functools import partial
+import os
 
 import cuda.bindings.driver as cuda
 
@@ -530,6 +531,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
 
         SharedStorage = self._get_shared_storage_cls()
+        if const_expr(os.environ.get("CUTE_TREE_RESOURCE_DIAG") == "1"):
+            print(
+                "[CUTE_TREE_RESOURCE]"
+                f" tile_m={self.tile_m} tile_n={self.tile_n} stages={self.num_stages}"
+                f" threads={self.num_threads} mma_wg={self.num_wg_mma}"
+                f" regs_mma={self.num_mma_regs} regs_producer={self.num_producer_regs}"
+                f" shared_total={SharedStorage.size_in_bytes()}"
+                f" sQ={sQ_struct.size_in_bytes()} sK={sK_struct.size_in_bytes()}"
+                f" sV={sV_struct.size_in_bytes()} sP={sP_struct.size_in_bytes()}"
+                f" mbar_q={mbar_ptr_Q_struct.size_in_bytes()}"
+                f" mbar_k={mbar_ptr_K_struct.size_in_bytes()}"
+                f" mbar_v={mbar_ptr_V_struct.size_in_bytes()}"
+                f" logical_sK8={sK8_struct.size_in_bytes()}"
+                f" logical_sV8={sV8_struct.size_in_bytes()}"
+                f" alias_convert_smem={self.alias_convert_smem}"
+            )
 
         mQ_og, mO_og = mQ, mO
         if const_expr(self.pack_gqa):
