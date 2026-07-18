@@ -340,8 +340,6 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
 
     Returns (causal, local, window_size_left, window_size_right).
     """
-    if mask_mod is not None:
-        return False, False, window_size_left, window_size_right
     if causal:
         window_size_right = 0
     if window_size_left is not None and window_size_right is not None and window_size_left + window_size_right < 0:
@@ -467,7 +465,25 @@ def _flash_attn_fwd(
     assert q.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], (
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
-    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    # fa4hybrid: FP8-QK hybrid allows V in bf16/fp16 (Arm B, native 16-bit V) or fp8
+    # (Arm C, convert-on-load) while Q/K are fp8. Non-fp8 keeps the uniform-dtype rule.
+    if q.dtype == torch.float8_e4m3fn:
+        assert k.dtype == q.dtype, "K must match Q dtype (fp8_e4m3)"
+        assert v.dtype in (torch.float8_e4m3fn, torch.float16, torch.bfloat16), (
+            "V must be fp8_e4m3 (hybrid convert-on-load), fp16, or bf16 (hybrid native)"
+        )
+    elif (
+        q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        and page_table is not None
+    ):
+        # M10b: K-convert-on-load. Q arrives already-dequantized bf16/f16; K stays fp8
+        # in the paged cache; V may also be fp8 (convert-on-load) or match Q's dtype.
+        assert v.dtype in (torch.float8_e4m3fn, torch.float16, torch.bfloat16), (
+            "V must be fp8_e4m3 (convert-on-load), fp16, or bf16 (match Q)"
+        )
+    else:
+        assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
             assert t.dtype == torch.int32, (
@@ -516,6 +532,23 @@ def _flash_attn_fwd(
         pack_gqa = qhead_per_kvhead > 1
 
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    # M10b: K-convert-on-load selector -- bf16/f16 Q with fp8 paged K. The fused
+    # convert-on-load path targets the paged KV cache (page_table required).
+    is_k_convert = (
+        q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        and page_table is not None
+    )
+    if is_k_convert:
+        # Q arrives already real-valued (host-dequantized) -- only K/V descale apply.
+        # K's descale is a linear scalar on the K operand of Q@K^T, so it folds exactly
+        # into softmax_scale (mirrors how q_descale*k_descale fold for the fp8-QK
+        # arm). V's descale folds into the final output further below (PV is linear
+        # in V). Assumes per-tensor STATIC descale (uniform across batch/head).
+        if q_descale is not None:
+            softmax_scale = softmax_scale * float(q_descale.reshape(-1)[0].item())
+        if k_descale is not None:
+            softmax_scale = softmax_scale * float(k_descale.reshape(-1)[0].item())
     if is_fp8 and (q.requires_grad or k.requires_grad or v.requires_grad):
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
     if output_scale is not None:
@@ -560,7 +593,7 @@ def _flash_attn_fwd(
             lse.fill_(float("-inf"))
         return out, lse
 
-    if is_fp8:
+    if is_fp8 or is_k_convert:
         for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
             if t is not None:
                 _validate_tensor(t, name, (batch_size, num_head_kv), torch.float32, device)
@@ -571,7 +604,10 @@ def _flash_attn_fwd(
 
     dtype = torch2cute_dtype_map[q.dtype]
     if is_fp8:
-        assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
+        # FA4-build (fa4build): SM90 fp8-KV path enabled. SM90 uses native fp8 wgmma with
+        # per-tensor static descale folded into softmax_scale (q*k) + output (v) outside the
+        # kernel (see _fa4build_fold below), so no in-kernel descale plumbing is needed on SM90.
+        assert arch // 10 in (9, 10), "FP8 is supported on SM90 (fa4build) and SM100 for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
@@ -602,6 +638,25 @@ def _flash_attn_fwd(
         elif arch // 10 == 9:
             sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
             fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=sparse_q)
+            if is_k_convert and head_dim <= 256:
+                fwd_cfg = FwdConfig(
+                    fwd_cfg.m_block_size,
+                    min(fwd_cfg.n_block_size, 32),
+                    fwd_cfg.mma_pv_is_rs,
+                    fwd_cfg.intra_wg_overlap,
+                )
+            if is_k_convert and head_dim > 256 and os.environ.get("M10_TILEN32", "0") == "1":
+                # M10b legacy fallback (opt-in via M10_TILEN32=1): halve tile_n. No longer
+                # needed -- M10 tile64 aliases the fp8 sK8 staging onto sK's bf16 region,
+                # reclaiming the ~32KB that forced the halving, so tile_n=64 now fits the
+                # SM90 228KB budget (263168 -> 230400 B < 232448 B). Kept only as an escape
+                # hatch if a future shape re-oversubscribes smem.
+                fwd_cfg = FwdConfig(
+                    fwd_cfg.m_block_size,
+                    max(fwd_cfg.n_block_size // 2, 16),
+                    fwd_cfg.mma_pv_is_rs,
+                    fwd_cfg.intra_wg_overlap,
+                )
     else:
         fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
@@ -787,6 +842,9 @@ def _flash_attn_fwd(
 
     compile_key = (
         dtype,
+        torch2cute_dtype_map[v.dtype],  # fa4hybrid: V dtype may differ from Q/K dtype
+        torch2cute_dtype_map[k.dtype],  # M10b: K dtype may differ from the compute dtype
+        out.dtype,
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
@@ -930,6 +988,12 @@ def _flash_attn_fwd(
                 head_dim,
                 head_dim_v,
                 qhead_per_kvhead,
+                # fa4hybrid: V/O dtypes may differ from the QK compute dtype
+                dtype_v=torch2cute_dtype_map[v.dtype],
+                dtype_o=torch2cute_dtype_map[out.dtype],
+                # M10b: K stays fp8 in the paged cache while dtype (above) is the bf16
+                # QK-compute dtype -- triggers k_convert in the kernel.
+                dtype_k=torch2cute_dtype_map[k.dtype] if is_k_convert else None,
                 is_causal=causal,
                 is_local=local,
                 is_split_kv=is_split_kv,
@@ -1142,13 +1206,22 @@ def _flash_attn_fwd(
     if not is_fake_mode():
         q_call, k_call, v_call = q.detach(), k.detach(), v.detach()
         qv_call = qv.detach() if qv is not None else None
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
         if is_fp8:
             # need uint8 workaround until we pin torch >= 2.11.0 where fp8 export is supported
+            # fa4hybrid: only view the tensors that are actually fp8 (V may be bf16 in Arm B)
             q_call = q_call.view(torch.uint8)
             k_call = k_call.view(torch.uint8)
-            v_call = v_call.view(torch.uint8)
+            if v_call.dtype in fp8_dtypes:
+                v_call = v_call.view(torch.uint8)
             if qv_call is not None:
                 qv_call = qv_call.view(torch.uint8)
+        elif is_k_convert:
+            # M10b: Q is bf16/f16 (no view needed) but K (and maybe V) are physically
+            # fp8 -- apply the same uint8 export workaround to those tensors only.
+            k_call = k_call.view(torch.uint8)
+            if v_call.dtype in fp8_dtypes:
+                v_call = v_call.view(torch.uint8)
         out_call = out.detach()
         if out_call.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             out_call = out_call.view(torch.uint8)
@@ -1225,6 +1298,11 @@ def _flash_attn_fwd(
             seqused_q,
             output_scale=output_scale,
         )
+    if is_k_convert and v_descale is not None:
+        # M10b: V's descale is a linear scalar on the PV operand -> folds exactly into
+        # the (already fully combined, if split-KV) output. Assumes per-tensor STATIC
+        # descale (uniform across batch/head), matching the k_descale assumption above.
+        out.mul_(float(v_descale.reshape(-1)[0].item()))
     return out, lse
 
 

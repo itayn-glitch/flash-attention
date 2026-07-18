@@ -56,9 +56,34 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
         is_split_kv: bool = False,
+        dtype_k=None,
         **kwargs,
     ):
+        # M10b: K-convert-on-load. K (and/or V) may be stored fp8 in HBM while the
+        # QK/PV compute dtype (kwargs["dtype"], e.g. bf16) differs -- mirrors the
+        # existing V-convert (Arm C) split, applied to K. The base ctor only allows
+        # dtype_v != dtype when dtype == Float8E4M3FN (the fp8-QK hybrid arms), so for
+        # a bf16-QK K/V-convert arm we withhold dtype_v from the base call and patch
+        # self.dtype_v/self.dtype_pv/self.v_convert in ourselves afterward -- this
+        # keeps the existing fp8-QK Arm C path (dtype==fp8) byte-for-byte unchanged.
+        dtype_arg = kwargs.get("dtype", args[0] if args else None)
+        dtype_v_arg = kwargs.get("dtype_v", None)
+        defer_dtype_v = (
+            dtype_v_arg is not None
+            and dtype_arg != cutlass.Float8E4M3FN
+            and dtype_v_arg != dtype_arg
+        )
+        if defer_dtype_v:
+            kwargs = dict(kwargs)
+            kwargs.pop("dtype_v")
         super().__init__(*args, **kwargs)
+        if defer_dtype_v:
+            self.dtype_v = dtype_v_arg
+            self.dtype_pv = self.dtype
+            self.v_convert = self.dtype_pv != self.dtype_v
+        # M10b: K storage dtype (fp8, paged) vs self.dtype (QK compute, bf16).
+        self.dtype_k = dtype_k if dtype_k is not None else self.dtype
+        self.k_convert = self.dtype_k != self.dtype
         assert self.output_quant_key is None, (
             f"Fused quant output not implemented for {type(self).__name__}"
         )
@@ -67,11 +92,64 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.buffer_align_bytes = 1024
         self.use_tma_KV = not paged_kv_non_tma
         self.is_split_kv = is_split_kv
+        self.alias_convert_smem = self.num_stages == 1
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
         )
         self.cluster_shape_mn = (1, 1)
         assert self.arch.is_family_of(Arch.sm_90a), "Only SM 9.x is supported"
+
+    def _check_type(
+        self,
+        mQ_type,
+        mK_type,
+        mV_type,
+        mO_type,
+        mLSE_type,
+        mCuSeqlensQ_type,
+        mCuSeqlensK_type,
+        mSeqUsedQ_type,
+        mSeqUsedK_type,
+        is_split_kv: bool = False,
+    ):
+        # M10b: bf16(-or-f16)-QK with fp8-paged K (+ optionally V) convert-on-load.
+        # Q is handed already-dequantized (real-valued) bf16/f16; K is raw fp8 codes
+        # matching self.dtype_k; V may be fp8 (convert-on-load) or match self.dtype.
+        if const_expr(self.k_convert):
+            if const_expr(mQ_type not in [cutlass.BFloat16, cutlass.Float16]):
+                raise TypeError("M10b K-convert path: Q must be bf16 or f16")
+            if const_expr(mK_type != self.dtype_k):
+                raise TypeError(f"M10b K-convert path: K must be stored as {self.dtype_k}")
+            if const_expr(
+                mV_type not in [cutlass.Float8E4M3FN, cutlass.Float16, cutlass.BFloat16]
+            ):
+                raise TypeError("M10b K-convert path: V must be fp8_e4m3/f16/bf16")
+            if const_expr(mO_type not in [cutlass.BFloat16, cutlass.Float16, Float32]):
+                raise TypeError("M10b K-convert path: O must be bf16/f16/f32")
+            if const_expr(mLSE_type not in [None, Float32]):
+                raise TypeError("LSE tensor must be Float32")
+            if const_expr(mCuSeqlensQ_type not in [None, Int32]):
+                raise TypeError("cu_seqlens_q tensor must be Int32")
+            if const_expr(mCuSeqlensK_type not in [None, Int32]):
+                raise TypeError("cu_seqlens_k tensor must be Int32")
+            if const_expr(mSeqUsedQ_type not in [None, Int32]):
+                raise TypeError("seqused_q tensor must be Int32")
+            if const_expr(mSeqUsedK_type not in [None, Int32]):
+                raise TypeError("seqused_k tensor must be Int32")
+            assert mQ_type == self.dtype
+            return
+        return super()._check_type(
+            mQ_type,
+            mK_type,
+            mV_type,
+            mO_type,
+            mLSE_type,
+            mCuSeqlensQ_type,
+            mCuSeqlensK_type,
+            mSeqUsedQ_type,
+            mSeqUsedK_type,
+            is_split_kv=is_split_kv,
+        )
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -79,19 +157,45 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.dtype,
         )
         sK_layout_atom = sQ_layout_atom
+        # M10b: separate raw-fp8 K staging atom (paged cp.async load target), mirrors sV8.
+        self.sK8_layout_atom = None
+        if self.k_convert:
+            self.sK8_layout_atom = warpgroup.make_smem_layout_atom(
+                sm90_utils_basic.get_smem_layout_atom(
+                    LayoutEnum.ROW_MAJOR, self.dtype_k, self.tile_hdim
+                ),
+                self.dtype_k,
+            )
+        # fa4hybrid: sV is the PV-GEMM operand buffer, typed by the PV compute dtype
+        # (bf16/fp16 in hybrid arms), NOT the QK dtype.
         sV_layout_atom = warpgroup.make_smem_layout_atom(
             sm90_utils_basic.get_smem_layout_atom(
-                LayoutEnum.ROW_MAJOR, self.dtype, self.tile_hdimv
+                LayoutEnum.ROW_MAJOR, self.dtype_pv, self.tile_hdimv
             ),
-            self.dtype,
+            self.dtype_pv,
         )
-        sO_layout_atom = sV_layout_atom
+        # fa4hybrid Arm C: separate raw-fp8 V staging atom (TMA/cp.async load target)
+        self.sV8_layout_atom = None
+        if self.v_convert:
+            self.sV8_layout_atom = warpgroup.make_smem_layout_atom(
+                sm90_utils_basic.get_smem_layout_atom(
+                    LayoutEnum.ROW_MAJOR, self.dtype_v, self.tile_hdimv
+                ),
+                self.dtype_v,
+            )
+        # fa4hybrid: O epilogue buffer typed by the output dtype (bf16)
+        sO_layout_atom = warpgroup.make_smem_layout_atom(
+            sm90_utils_basic.get_smem_layout_atom(
+                LayoutEnum.ROW_MAJOR, self.dtype_o, self.tile_hdimv
+            ),
+            self.dtype_o,
+        )
         if not self.mma_pv_is_rs:
             sP_layout_atom = warpgroup.make_smem_layout_atom(
                 sm90_utils_basic.get_smem_layout_atom(
-                    LayoutEnum.ROW_MAJOR, self.dtype, self.tile_n
+                    LayoutEnum.ROW_MAJOR, self.dtype_pv, self.tile_n
                 ),
-                self.dtype,
+                self.dtype_pv,
             )
         else:
             sP_layout_atom = None
@@ -108,9 +212,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             atom_layout_mnk=(self.tile_m // 64, atom_layout_n, 1),
             tiler_mn=(64, self.tile_n),
         )
+        # fa4hybrid: the PV wgmma runs in dtype_pv (fp16/bf16 for hybrid arms). fp16/bf16
+        # wgmma accepts an MN-major B operand, so V keeps its natural (tile_n, head_dim_v)
+        # smem layout with a transpose_view -- NO physical V transpose (this is the whole
+        # point of the hybrid design; fp8 wgmma would force a K-major V).
         tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
-            self.dtype,
-            self.dtype,
+            self.dtype_pv,
+            self.dtype_pv,
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.MN,
             Float32,
@@ -127,16 +235,64 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return tiled_mma_qk, tiled_mma_pv
 
     def _get_shared_storage_cls(self):
-        sQ_struct, sK_struct, sV_struct = [
-            cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(layout)], self.buffer_align_bytes
-            ]
-            for layout in (self.sQ_layout, self.sK_layout, self.sV_layout)
+        # fa4hybrid: each smem buffer is typed by its own dtype:
+        #   sQ/sK: self.dtype (fp8 in hybrid), sV: dtype_pv (fp16/bf16), sV8: dtype_v (fp8
+        #   staging, Arm C only). The O epilogue overlays the sQ buffer but O is bf16 while
+        #   Q may be fp8, so the union buffer is sized max(bytes(sQ), bytes(sO)) in units
+        #   of self.dtype.
+        sV8_cosize = (
+            cute.cosize(self.sV8_layout) if const_expr(self.sV8_layout is not None) else 0
+        )
+        sK8_cosize = (
+            cute.cosize(self.sK8_layout) if const_expr(self.sK8_layout is not None) else 0
+        )
+        # M10 tile64: the fp8 K staging (sK8) is ALIASED onto sK's bf16 region instead of
+        # getting its own buffer -- sK is 2x the bytes/elem so it holds the fp8 staging
+        # in-place. This reclaims one ~32KB buffer, the exact overflow that forced
+        # tile_n 64->32. Size sK's MemRange to cover BOTH the bf16 compute layout and the
+        # (smaller) fp8 staging layout (fp8 bytes rounded up to whole bf16 elements).
+        cosize_sK = cute.cosize(self.sK_layout)
+        if const_expr(self.k_convert):
+            cosize_sK = max(
+                cosize_sK,
+                (sK8_cosize * self.dtype_k.width + self.dtype.width - 1) // self.dtype.width,
+            )
+        sK_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype, cosize_sK],
+            self.buffer_align_bytes,
         ]
-        cosize_sQV = max(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
+        # M10 tile64: the fp8 V staging (sV8) is ALIASED onto sV's bf16 region (same
+        # technique + safety argument as sK8/sK), reclaiming a second ~32KB buffer.
+        cosize_sV = cute.cosize(self.sV_layout)
+        if const_expr(self.v_convert and self.alias_convert_smem):
+            cosize_sV = max(
+                cosize_sV,
+                (sV8_cosize * self.dtype_v.width + self.dtype_pv.width - 1) // self.dtype_pv.width,
+            )
+        sV_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype_pv, cosize_sV],
+            self.buffer_align_bytes,
+        ]
+        sK8_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype_k, sK8_cosize],
+            self.buffer_align_bytes,
+        ]
+        sV8_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype_v, sV8_cosize],
+            self.buffer_align_bytes,
+        ]
+        cosize_sQO = max(
+            cute.cosize(self.sQ_layout),
+            (cute.cosize(self.sO_layout) * self.dtype_o.width + self.dtype.width - 1)
+            // self.dtype.width,
+        )
+        sQ_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype, cosize_sQO], self.buffer_align_bytes
+        ]
+        cosize_sQV = max(cosize_sQO, cute.cosize(self.sV_layout))
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
         cosize_sP = cute.cosize(self.sP_layout) if const_expr(self.sP_layout is not None) else 0
-        sP_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sP], 1024]
+        sP_struct = cute.struct.Align[cute.struct.MemRange[self.dtype_pv, cosize_sP], 1024]
         # 1 stage * 2 for Q pipeline (full + empty), self.num_stages*2 for K, self.num_stages*2 for V,
         mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
         mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
@@ -151,6 +307,85 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sQ: sQ_struct
             sK: sK_struct
             sP: sP_struct
+
+        if const_expr(self.v_convert and not self.k_convert):
+            if const_expr(self.alias_convert_smem):
+                @cute.struct
+                class SharedStorageQKVV8:
+                    mbar_ptr_Q: mbar_ptr_Q_struct
+                    mbar_ptr_K: mbar_ptr_K_struct
+                    mbar_ptr_V: mbar_ptr_V_struct
+                    sV: sV_struct
+                    sQ: sQ_struct
+                    sK: sK_struct
+                    sP: sP_struct
+            else:
+                @cute.struct
+                class SharedStorageQKVV8:
+                    mbar_ptr_Q: mbar_ptr_Q_struct
+                    mbar_ptr_K: mbar_ptr_K_struct
+                    mbar_ptr_V: mbar_ptr_V_struct
+                    sV: sV_struct
+                    sV8: sV8_struct
+                    sQ: sQ_struct
+                    sK: sK_struct
+                    sP: sP_struct
+
+            assert not self.Q_in_regs, "fa4hybrid Arm C does not support Q_in_regs"
+            return SharedStorageQKVV8
+
+        if const_expr(self.k_convert and not self.v_convert):
+            if const_expr(self.alias_convert_smem):
+                @cute.struct
+                class SharedStorageQKVK8:
+                    mbar_ptr_Q: mbar_ptr_Q_struct
+                    mbar_ptr_K: mbar_ptr_K_struct
+                    mbar_ptr_V: mbar_ptr_V_struct
+                    sV: sV_struct
+                    sQ: sQ_struct
+                    sK: sK_struct
+                    sP: sP_struct
+            else:
+                @cute.struct
+                class SharedStorageQKVK8:
+                    mbar_ptr_Q: mbar_ptr_Q_struct
+                    mbar_ptr_K: mbar_ptr_K_struct
+                    mbar_ptr_V: mbar_ptr_V_struct
+                    sV: sV_struct
+                    sQ: sQ_struct
+                    sK: sK_struct
+                    sK8: sK8_struct
+                    sP: sP_struct
+
+            assert not self.Q_in_regs, "M10b K-convert does not support Q_in_regs"
+            return SharedStorageQKVK8
+
+        if const_expr(self.k_convert and self.v_convert):
+            if const_expr(self.alias_convert_smem):
+                @cute.struct
+                class SharedStorageQKVK8V8:
+                    mbar_ptr_Q: mbar_ptr_Q_struct
+                    mbar_ptr_K: mbar_ptr_K_struct
+                    mbar_ptr_V: mbar_ptr_V_struct
+                    sV: sV_struct
+                    sQ: sQ_struct
+                    sK: sK_struct
+                    sP: sP_struct
+            else:
+                @cute.struct
+                class SharedStorageQKVK8V8:
+                    mbar_ptr_Q: mbar_ptr_Q_struct
+                    mbar_ptr_K: mbar_ptr_K_struct
+                    mbar_ptr_V: mbar_ptr_V_struct
+                    sV: sV_struct
+                    sV8: sV8_struct
+                    sQ: sQ_struct
+                    sK: sK_struct
+                    sK8: sK8_struct
+                    sP: sP_struct
+
+            assert not self.Q_in_regs, "M10b K-convert does not support Q_in_regs"
+            return SharedStorageQKVK8V8
 
         @cute.struct
         class SharedStorageSharedQV:
@@ -218,6 +453,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mO = layout_utils.select(mO, O_layout_transpose)
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         mK, mV = [layout_utils.select(t, KV_layout_transpose) for t in (mK, mV)]
+        # fa4hybrid: V keeps its natural (s_k, dv, ...) layout in gmem for ALL arms.
+        # (The old fa4build all-fp8 gmem V-transpose is gone -- TMA cannot transpose, and
+        # the hybrid PV wgmma in fp16/bf16 takes MN-major V directly.)
         mLSE = (
             layout_utils.select(mLSE, LSE_layout_transpose)
             if const_expr(mLSE is not None)
@@ -253,20 +491,42 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
+        # fa4hybrid: per-buffer dtypes. sV is the PV compute buffer (dtype_pv); Arm C adds
+        # a raw-fp8 staging buffer sV8 (dtype_v) that TMA/cp.async lands into.
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
-            sm90_utils.make_smem_layout(mX.element_type, LayoutEnum.ROW_MAJOR, shape, stage)
-            for mX, shape, stage in [
-                (mQ, (self.tile_m, self.tile_hdim), None),
-                (mK, (self.tile_n, self.tile_hdim), self.num_stages),
-                (mV, (self.tile_n, self.tile_hdimv), self.num_stages),
+            sm90_utils.make_smem_layout(dt, LayoutEnum.ROW_MAJOR, shape, stage)
+            for dt, shape, stage in [
+                (mQ.element_type, (self.tile_m, self.tile_hdim), None),
+                # M10b: sK is the QK-GEMM compute buffer, typed self.dtype (bf16 when
+                # k_convert), NOT mK.element_type (the fp8 storage dtype) -- mirrors sV.
+                (self.dtype, (self.tile_n, self.tile_hdim), self.num_stages),
+                (self.dtype_pv, (self.tile_n, self.tile_hdimv), self.num_stages),
                 # sO layout dtype possibly different from mO dtype when using splitkv (fp32)
-                (mQ, (self.tile_m, self.tile_hdimv), None),
+                (self.dtype_o if const_expr(not self.is_split_kv) else mQ.element_type,
+                 (self.tile_m, self.tile_hdimv), None),
             ]
         ]
+        self.sV8_layout = None
+        if const_expr(self.v_convert):
+            self.sV8_layout = sm90_utils.make_smem_layout(
+                mV.element_type,
+                LayoutEnum.ROW_MAJOR,
+                (self.tile_n, self.tile_hdimv),
+                self.num_stages,
+            )
+        # M10b: raw fp8 K staging smem layout (paged cp.async load target). Mirrors sV8.
+        self.sK8_layout = None
+        if const_expr(self.k_convert):
+            self.sK8_layout = sm90_utils.make_smem_layout(
+                mK.element_type,
+                LayoutEnum.ROW_MAJOR,
+                (self.tile_n, self.tile_hdim),
+                self.num_stages,
+            )
         self.sP_layout = None
         if const_expr(not self.mma_pv_is_rs):
             self.sP_layout = sm90_utils.make_smem_layout(
-                mV.element_type, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_n)
+                self.dtype_pv, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_n)
             )
 
         SharedStorage = self._get_shared_storage_cls()
@@ -283,12 +543,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         gmem_tiled_copy_Q = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()  # Might multicast
         gmem_tiled_copy_O = cpasync.CopyBulkTensorTileS2GOp()
+        # fa4hybrid: V TMA lands into the staging buffer (fp8) for Arm C, else into sV.
+        sV_tma_layout = self.sV8_layout if const_expr(self.v_convert) else self.sV_layout
+        sK_tma_layout = self.sK8_layout if const_expr(self.k_convert) else self.sK_layout
         self.tma_copy_bytes = {
             name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1]))
             for name, mX, layout in [
                 ("Q", mQ, self.sQ_layout),
-                ("K", mK, self.sK_layout),
-                ("V", mV, self.sV_layout),
+                ("K", mK, sK_tma_layout),
+                ("V", mV, sV_tma_layout),
             ]
         }
         make_tiled_tma_atom_fn = (
@@ -310,14 +573,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
                 mK,
-                cute.select(self.sK_layout, mode=[0, 1]),
+                cute.select(sK_tma_layout, mode=[0, 1]),
                 (self.tile_n, self.tile_hdim),
                 1,  # No mcast for now
             )
             tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
                 mV,
-                cute.select(self.sV_layout, mode=[0, 1]),
+                cute.select(sV_tma_layout, mode=[0, 1]),
                 (self.tile_n, self.tile_hdimv),
                 1,  # No mcast for now
             )
@@ -401,7 +664,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             blocksparse_tensors,
             self.sQ_layout,
             self.sK_layout,
+            self.sK8_layout,
             self.sV_layout,
+            self.sV8_layout,
             self.sO_layout,
             self.sP_layout,
             self.gmem_tiled_copy_Q,
@@ -450,7 +715,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         blocksparse_tensors: Optional[BlockSparseTensors],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
+        sK8_layout: cute.ComposedLayout | None,
         sV_layout: cute.ComposedLayout,
+        sV8_layout: cute.ComposedLayout | None,
         sO_layout: cute.ComposedLayout,
         sP_layout: cute.ComposedLayout | None,
         gmem_tiled_copy_Q: cute.TiledCopy,
@@ -549,19 +816,50 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # ///////////////////////////////////////////////////////////////////////////////
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+        # M10b: raw fp8 K staging buffer (paged cp.async target); consumer upconverts
+        # sK8 -> sK (bf16) in the MAIN LOOP before the QK wgmma. Mirrors sV8/v_convert.
+        # M10 tile64: sK8 ALIASES sK's smem region (reinterpreted as fp8) rather than a
+        # separate buffer -- reclaims ~32KB so tile_n=64 fits the SM90 228KB budget.
+        # Safe: pipeline_k gates the producer's next fp8 load on consumer_release, which
+        # only fires after the QK gemm reading sK has drained (warpgroup.wait_group), so
+        # the fp8 staging write never overlaps a live bf16 sK read; k_convert_fn adds a
+        # read-complete barrier so the cooperative in-place fp8->bf16 convert is race-free.
+        sK8 = None
+        if const_expr(self.k_convert):
+            sK8_storage = storage.sK if const_expr(self.alias_convert_smem) else storage.sK8
+            sK8 = sK8_storage.get_tensor(
+                sK8_layout.outer, swizzle=sK8_layout.inner, dtype=self.dtype_k
+            )
         if const_expr(not self.Q_in_regs):
             sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         else:
             sV = storage.sQ.get_tensor(
-                sV_layout.outer, swizzle=sV_layout.inner, dtype=mV.element_type
+                sV_layout.outer, swizzle=sV_layout.inner, dtype=self.dtype_pv
             )
-        # Transpose view of V to tensor with layout (head_dim_v, tile_n) for tiled mma
+        # fa4hybrid Arm C: raw fp8 V staging buffer (TMA target); consumer upconverts
+        # sV8 -> sV (fp16) before the PV wgmma.
+        # M10 tile64: sV8 ALIASES sV's smem region (reinterpreted as fp8), mirroring
+        # sK8/sK. Safe by the same argument -- pipeline_v gates the producer's next fp8
+        # V load on consumer_release, which fires only after the PV gemm reading sV has
+        # drained; v_convert_fn adds a read-complete barrier for the in-place convert.
+        sV8 = None
+        if const_expr(self.v_convert):
+            sV8_storage = storage.sV if const_expr(self.alias_convert_smem) else storage.sV8
+            sV8 = sV8_storage.get_tensor(
+                sV8_layout.outer, swizzle=sV8_layout.inner, dtype=self.dtype_v
+            )
+        # V is presented to the PV mma as (head_dim_v, tile_n) via a transpose_view of the
+        # natural MN-major (tile_n, head_dim_v) buffer -- valid for fp16/bf16 wgmma.
         sVt = layout_utils.transpose_view(sV)
         sP = None
         if const_expr(sP_layout is not None):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
-        # reuse sQ's data iterator
-        sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
+        # reuse sQ's data iterator; O is stored in dtype_o (bf16 for hybrid arms)
+        sO = storage.sQ.get_tensor(
+            sO_layout.outer,
+            swizzle=sO_layout.inner,
+            dtype=self.dtype_o if const_expr(not self.is_split_kv) else self.dtype,
+        )
 
         block_info = BlockInfo(
             self.tile_m,
@@ -614,8 +912,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mK,
                 mV,
                 sQ,
-                sK,
-                sV,
+                # M10b: K loads (TMA or paged cp.async) land in the fp8 staging buffer
+                sK8 if const_expr(self.k_convert) else sK,
+                # Arm C: V loads (TMA or paged cp.async) land in the fp8 staging buffer
+                sV8 if const_expr(self.v_convert) else sV,
                 tma_atom_Q,
                 tma_atom_K,
                 tma_atom_V,
@@ -645,7 +945,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mLSE,
                 sQ,
                 sK,
+                sK8,
                 sVt,
+                sV,
+                sV8,
                 sP,
                 sO,
                 learnable_sink,
@@ -991,7 +1294,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mLSE: Optional[cute.Tensor],
         sQ: cute.Tensor,
         sK: cute.Tensor,
+        sK8: Optional[cute.Tensor],
         sVt: cute.Tensor,
+        sV: cute.Tensor,
+        sV8: Optional[cute.Tensor],
         sP: Optional[cute.Tensor],
         sO: cute.Tensor,
         learnable_sink: Optional[cute.Tensor],
@@ -1034,11 +1340,147 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # Smem copy atom tiling
         # ///////////////////////////////////////////////////////////////////////////////
         smem_copy_atom_P = utils.get_smem_store_atom(
-            self.arch.major * 10 + self.arch.minor, self.dtype
+            self.arch.major * 10 + self.arch.minor, self.dtype_pv
         )
         smem_thr_copy_P = cute.make_tiled_copy_C(smem_copy_atom_P, tiled_mma_qk).get_slice(tidx)
         tPsP = smem_thr_copy_P.partition_D(sP) if const_expr(sP is not None) else None
         smem_copy_params = SimpleNamespace(smem_thr_copy_P=smem_thr_copy_P, tPsP=tPsP)
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        # fa4hybrid Arm C: cooperative fp8 -> fp16 V upconversion (staging sV8 -> sV).
+        # All num_mma_threads participate; each converts a disjoint slice of the
+        # (tile_n, tile_hdimv) stage, then a named barrier + async fence makes the fp16
+        # tile visible to the PV wgmma of both warpgroups.
+        # ///////////////////////////////////////////////////////////////////////////////
+        v_convert_fn = None
+        if const_expr(self.v_convert):
+            v_cvt_elems = 128 // self.dtype_pv.width  # 8 fp16 -> 16B stores (swizzle-atomic)
+            v_cvt_thr_cols = self.tile_hdimv // v_cvt_elems
+            v_cvt_thr_rows = self.num_mma_threads // v_cvt_thr_cols
+            assert self.num_mma_threads % v_cvt_thr_cols == 0
+            assert self.tile_n % v_cvt_thr_rows == 0
+            v_cvt_thr_layout = cute.make_ordered_layout(
+                (v_cvt_thr_rows, v_cvt_thr_cols), order=(1, 0)
+            )
+            v_cvt_val_layout = cute.make_layout((1, v_cvt_elems))
+            v_cvt_atom_src = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.dtype_v,
+                num_bits_per_copy=v_cvt_elems * self.dtype_v.width,
+            )
+            v_cvt_atom_dst = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.dtype_pv,
+                num_bits_per_copy=v_cvt_elems * self.dtype_pv.width,
+            )
+            v_cvt_copy_src = cute.make_tiled_copy_tv(
+                v_cvt_atom_src, v_cvt_thr_layout, v_cvt_val_layout
+            ).get_slice(tidx)
+            v_cvt_copy_dst = cute.make_tiled_copy_tv(
+                v_cvt_atom_dst, v_cvt_thr_layout, v_cvt_val_layout
+            ).get_slice(tidx)
+            tVcvt_S = v_cvt_copy_src.partition_S(sV8)  # (CPY, rest_m, rest_n, stage)
+            tVcvt_D = v_cvt_copy_dst.partition_D(sV)
+
+            def v_convert_fn(stage):
+                src = tVcvt_S[None, None, None, stage]
+                dst = tVcvt_D[None, None, None, stage]
+                frag8 = cute.make_fragment_like(src)
+                cute.autovec_copy(src, frag8)
+                frag16 = cute.make_fragment_like(frag8, self.dtype_pv)
+                if const_expr(self.dtype_pv == cutlass.BFloat16):
+                    # M10b: no direct packed fp8->bf16 cvt lowering; hop through fp16
+                    # (exact for e4m3 source: e4m3 has <= 3 mantissa bits, well within
+                    # both fp16's 10 and bf16's 7, so no extra rounding is introduced).
+                    frag_mid = cute.make_fragment_like(frag8, cutlass.Float16)
+                    frag_mid.store(frag8.load().to(cutlass.Float16))
+                    frag16.store(frag_mid.load().to(self.dtype_pv))
+                else:
+                    frag16.store(frag8.load().to(self.dtype_pv))
+                # M10 tile64: sV8 aliases sV's region. Rendezvous ALL mma threads after the
+                # fp8 read (frag8) and before any bf16 write, so a store can't clobber
+                # another thread's not-yet-read fp8 source.
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.VConvert),
+                    number_of_threads=self.num_mma_threads,
+                )
+                cute.autovec_copy(frag16, dst)
+                # Make the fp16 stores visible to the async proxy (wgmma), then rendezvous
+                # both mma warpgroups so no PV gemm starts on a partially converted tile.
+                cute.arch.fence_view_async_shared()
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.VConvert),
+                    number_of_threads=self.num_mma_threads,
+                )
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        # M10b: cooperative fp8 -> bf16 K upconversion (staging sK8 -> sK). Structurally
+        # different from v_convert_fn: K feeds the QK wgmma in the MAIN LOOP, so this
+        # runs right after pipeline_k.consumer_wait and BEFORE mma_qk_fn (V converts in
+        # the PV epilogue instead, after pipeline_v.consumer_wait and before mma_pv_fn).
+        # Reuses the VConvert named barrier id -- safe because K-convert and V-convert
+        # rendezvous sequentially (never concurrently) within one n-block iteration,
+        # both across the same self.num_mma_threads.
+        # ///////////////////////////////////////////////////////////////////////////////
+        k_convert_fn = None
+        if const_expr(self.k_convert):
+            k_cvt_elems = 128 // self.dtype.width
+            k_cvt_thr_cols = self.tile_hdim // k_cvt_elems
+            k_cvt_thr_rows = self.num_mma_threads // k_cvt_thr_cols
+            assert self.num_mma_threads % k_cvt_thr_cols == 0
+            assert self.tile_n % k_cvt_thr_rows == 0
+            k_cvt_thr_layout = cute.make_ordered_layout(
+                (k_cvt_thr_rows, k_cvt_thr_cols), order=(1, 0)
+            )
+            k_cvt_val_layout = cute.make_layout((1, k_cvt_elems))
+            k_cvt_atom_src = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.dtype_k,
+                num_bits_per_copy=k_cvt_elems * self.dtype_k.width,
+            )
+            k_cvt_atom_dst = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.dtype,
+                num_bits_per_copy=k_cvt_elems * self.dtype.width,
+            )
+            k_cvt_copy_src = cute.make_tiled_copy_tv(
+                k_cvt_atom_src, k_cvt_thr_layout, k_cvt_val_layout
+            ).get_slice(tidx)
+            k_cvt_copy_dst = cute.make_tiled_copy_tv(
+                k_cvt_atom_dst, k_cvt_thr_layout, k_cvt_val_layout
+            ).get_slice(tidx)
+            tKcvt_S = k_cvt_copy_src.partition_S(sK8)  # (CPY, rest_m, rest_n, stage)
+            tKcvt_D = k_cvt_copy_dst.partition_D(sK)
+
+            def k_convert_fn(stage):
+                src = tKcvt_S[None, None, None, stage]
+                dst = tKcvt_D[None, None, None, stage]
+                frag8 = cute.make_fragment_like(src)
+                cute.autovec_copy(src, frag8)
+                frag16 = cute.make_fragment_like(frag8, self.dtype)
+                if const_expr(self.dtype == cutlass.BFloat16):
+                    # M10b: no direct packed fp8->bf16 cvt lowering; hop through fp16
+                    # (exact for e4m3 source: e4m3 has <= 3 mantissa bits, well within
+                    # both fp16's 10 and bf16's 7, so no extra rounding is introduced).
+                    frag_mid = cute.make_fragment_like(frag8, cutlass.Float16)
+                    frag_mid.store(frag8.load().to(cutlass.Float16))
+                    frag16.store(frag_mid.load().to(self.dtype))
+                else:
+                    frag16.store(frag8.load().to(self.dtype))
+                # M10 tile64: sK8 aliases sK's region. Every thread has now read its fp8
+                # slice into registers (frag8); rendezvous ALL mma threads BEFORE any
+                # thread writes the wider bf16 result back into the same bytes, else a
+                # bf16 store would clobber another thread's not-yet-read fp8 source.
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.VConvert),
+                    number_of_threads=self.num_mma_threads,
+                )
+                cute.autovec_copy(frag16, dst)
+                cute.arch.fence_view_async_shared()
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.VConvert),
+                    number_of_threads=self.num_mma_threads,
+                )
 
         self.mma_init()
 
@@ -1072,6 +1514,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             smem_copy_params=smem_copy_params,
             check_inf=True,
             scores_scale=scores_scale,
+            v_convert_fn=v_convert_fn,
+            k_convert_fn=k_convert_fn,
         )
 
         process_first_half_block = partial(
@@ -1083,6 +1527,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             scores_scale=scores_scale,
             softmax=softmax,
             acc_O=acc_O,
+            k_convert_fn=k_convert_fn,
         )
         process_last_half_block = partial(
             self.last_half_block_overlap,
@@ -1091,6 +1536,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             scores_scale=scores_scale,
             softmax=softmax,
             acc_O=acc_O,
+            v_convert_fn=v_convert_fn,
         )
         while work_tile.is_valid_tile:
             # if work_tile.is_valid_tile:
@@ -1379,10 +1825,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Callable = None,
         score_mod_fn: Optional[Callable] = None,
         is_first_block: bool = False,
+        k_convert_fn: Optional[Callable] = None,
     ):
         """Processes the first half block when using intra-warpgroup-overlap"""
 
         pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
+        if const_expr(k_convert_fn is not None):
+            k_convert_fn(kv_consumer_state.index)
         acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
         pipeline_k.consumer_release(kv_consumer_state)
 
@@ -1401,9 +1850,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tOrP_cur = (
             tOrP
             if const_expr(self.mma_pv_is_rs)
-            else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
+            else cute.make_rmem_tensor_like(tOrP_acc, self.dtype_pv)
         )
-        tOrP_cur.store(tOrP_acc.load().to(self.dtype))
+        if const_expr(self.dtype_pv == cutlass.Float8E4M3FN):
+            tOrP_cur.store(tOrP_acc.load().to(self.dtype_pv))
+        else:
+            utils.cvt_f16(tOrP_acc, tOrP_cur)
 
         if const_expr(not self.mma_pv_is_rs):
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
@@ -1429,6 +1881,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         scores_scale: Optional[cute.Tensor] = None,
         softmax: Optional[Softmax] = None,
         acc_O: Optional[cute.Tensor] = None,
+        v_convert_fn: Optional[Callable] = None,
     ):
         """Processes the final PV GEMM when using intra-warpgroup-overlap"""
 
@@ -1437,6 +1890,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             softmax.rescale_O(acc_O, scores_scale)
 
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
+        if const_expr(v_convert_fn is not None):
+            v_convert_fn(kv_consumer_state.index)
         mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
         pipeline_v.consumer_release(kv_consumer_state)
         kv_consumer_state.advance()
@@ -1461,8 +1916,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
+        v_convert_fn: Optional[Callable] = None,
+        k_convert_fn: Optional[Callable] = None,
     ):
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
+        if const_expr(k_convert_fn is not None):
+            k_convert_fn(smem_pipe_read.index)
         # S = Q @ K.T
         acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
@@ -1481,13 +1940,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tOrP_cur = (
             tOrP
             if const_expr(self.mma_pv_is_rs)
-            else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
+            else cute.make_rmem_tensor_like(tOrP_acc, self.dtype_pv)
         )
         # tOrP.store(tOrP_acc.load().to(self.dtype))
         # the "to(self.dtype)" conversion fails to vectorize for block sizes other
         # than 128 x 128, i.e. it calls convert on 1 fp32 element at a time instead of
         # 2 elements. So we just call ptx directly.
-        utils.cvt_f16(tOrP_acc, tOrP_cur)
+        if const_expr(self.dtype_pv == cutlass.Float8E4M3FN):
+            # all-fp8 arm only: generic convert (cvt_f16 is a bf16/f16-only fast path)
+            tOrP_cur.store(tOrP_acc.load().to(self.dtype_pv))
+        else:
+            # fa4hybrid: P is downcast fp32 -> dtype_pv (fp16/bf16) for the PV wgmma
+            utils.cvt_f16(tOrP_acc, tOrP_cur)
         if const_expr(not self.mma_pv_is_rs):
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
@@ -1497,6 +1961,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
         pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
+        if const_expr(v_convert_fn is not None):
+            v_convert_fn(smem_pipe_read.index)
         self.warp_scheduler_barrier_sync()
         # O += P @ V
         mma_pv_fn(B_idx=smem_pipe_read.index, wg_wait=0)
@@ -1522,10 +1988,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
+        v_convert_fn: Optional[Callable] = None,
+        k_convert_fn: Optional[Callable] = None,
     ):
         smem_pipe_read_v = smem_pipe_read.clone()
         smem_pipe_read.advance()
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
+        if const_expr(k_convert_fn is not None):
+            k_convert_fn(smem_pipe_read.index)
         self.warp_scheduler_barrier_sync()
         # S = Q @ K.T
         acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
@@ -1533,6 +2003,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
         pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v))
+        if const_expr(v_convert_fn is not None):
+            v_convert_fn(smem_pipe_read_v.index)
         # O += P @ V
         mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
@@ -1553,13 +2025,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tOrP_cur = (
             tOrP
             if const_expr(self.mma_pv_is_rs)
-            else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
+            else cute.make_rmem_tensor_like(tOrP_acc, self.dtype_pv)
         )
         # tOrP_cur.store(tOrP_acc.load().to(self.dtype))
         # the "to(self.dtype)" conversion fails to vectorize for block sizes other
         # than 128 x 128, i.e. it calls convert on 1 fp32 element at a time instead of
         # 2 elements. So we just call ptx directly.
-        utils.cvt_f16(tOrP_acc, tOrP_cur)
+        if const_expr(self.dtype_pv == cutlass.Float8E4M3FN):
+            # all-fp8 arm only: generic convert (cvt_f16 is a bf16/f16-only fast path)
+            tOrP_cur.store(tOrP_acc.load().to(self.dtype_pv))
+        else:
+            # fa4hybrid: P is downcast fp32 -> dtype_pv (fp16/bf16) for the PV wgmma
+            utils.cvt_f16(tOrP_acc, tOrP_cur)
         if const_expr(not self.mma_pv_is_rs):
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
