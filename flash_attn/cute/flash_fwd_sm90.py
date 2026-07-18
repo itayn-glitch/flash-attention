@@ -1420,16 +1420,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 dst = tVcvt_D[None, None, None, stage]
                 frag8 = cute.make_fragment_like(src)
                 cute.autovec_copy(src, frag8)
-                frag16 = cute.make_fragment_like(frag8, self.dtype_pv)
-                if const_expr(self.dtype_pv == cutlass.BFloat16):
-                    # M10b: no direct packed fp8->bf16 cvt lowering; hop through fp16
-                    # (exact for e4m3 source: e4m3 has <= 3 mantissa bits, well within
-                    # both fp16's 10 and bf16's 7, so no extra rounding is introduced).
-                    frag_mid = cute.make_fragment_like(frag8, cutlass.Float16)
-                    frag_mid.store(frag8.load().to(cutlass.Float16))
-                    frag16.store(frag_mid.load().to(self.dtype_pv))
-                else:
-                    frag16.store(frag8.load().to(self.dtype_pv))
                 # M10 tile64: sV8 aliases sV's region. Rendezvous ALL mma threads after the
                 # fp8 read (frag8) and before any bf16 write, so a store can't clobber
                 # another thread's not-yet-read fp8 source.
@@ -1437,7 +1427,34 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     barrier_id=int(NamedBarrierFwd.VConvert),
                     number_of_threads=self.num_mma_threads,
                 )
-                cute.autovec_copy(frag16, dst)
+                if const_expr(
+                    os.environ.get("CUTE_TREE_CONVERT_CHUNKED") == "1"
+                    and self.tile_hdimv > 256
+                ):
+                    for rest_m in cutlass.range(cute.size(frag8, mode=[1]), unroll=1):
+                        for rest_n in cutlass.range(cute.size(frag8, mode=[2]), unroll=1):
+                            frag8_part = frag8[None, rest_m, rest_n]
+                            dst_part = dst[None, rest_m, rest_n]
+                            frag16 = cute.make_fragment_like(frag8_part, self.dtype_pv)
+                            if const_expr(self.dtype_pv == cutlass.BFloat16):
+                                frag_mid = cute.make_fragment_like(frag8_part, cutlass.Float16)
+                                frag_mid.store(frag8_part.load().to(cutlass.Float16))
+                                frag16.store(frag_mid.load().to(self.dtype_pv))
+                            else:
+                                frag16.store(frag8_part.load().to(self.dtype_pv))
+                            cute.autovec_copy(frag16, dst_part)
+                else:
+                    frag16 = cute.make_fragment_like(frag8, self.dtype_pv)
+                    if const_expr(self.dtype_pv == cutlass.BFloat16):
+                        # M10b: no direct packed fp8->bf16 cvt lowering; hop through fp16
+                        # (exact for e4m3 source: e4m3 has <= 3 mantissa bits, well within
+                        # both fp16's 10 and bf16's 7, so no extra rounding is introduced).
+                        frag_mid = cute.make_fragment_like(frag8, cutlass.Float16)
+                        frag_mid.store(frag8.load().to(cutlass.Float16))
+                        frag16.store(frag_mid.load().to(self.dtype_pv))
+                    else:
+                        frag16.store(frag8.load().to(self.dtype_pv))
+                    cute.autovec_copy(frag16, dst)
                 # Make the fp16 stores visible to the async proxy (wgmma), then rendezvous
                 # both mma warpgroups so no PV gemm starts on a partially converted tile.
                 cute.arch.fence_view_async_shared()
@@ -1490,16 +1507,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 dst = tKcvt_D[None, None, None, stage]
                 frag8 = cute.make_fragment_like(src)
                 cute.autovec_copy(src, frag8)
-                frag16 = cute.make_fragment_like(frag8, self.dtype)
-                if const_expr(self.dtype == cutlass.BFloat16):
-                    # M10b: no direct packed fp8->bf16 cvt lowering; hop through fp16
-                    # (exact for e4m3 source: e4m3 has <= 3 mantissa bits, well within
-                    # both fp16's 10 and bf16's 7, so no extra rounding is introduced).
-                    frag_mid = cute.make_fragment_like(frag8, cutlass.Float16)
-                    frag_mid.store(frag8.load().to(cutlass.Float16))
-                    frag16.store(frag_mid.load().to(self.dtype))
-                else:
-                    frag16.store(frag8.load().to(self.dtype))
                 # M10 tile64: sK8 aliases sK's region. Every thread has now read its fp8
                 # slice into registers (frag8); rendezvous ALL mma threads BEFORE any
                 # thread writes the wider bf16 result back into the same bytes, else a
@@ -1508,7 +1515,34 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     barrier_id=int(NamedBarrierFwd.VConvert),
                     number_of_threads=self.num_mma_threads,
                 )
-                cute.autovec_copy(frag16, dst)
+                if const_expr(
+                    os.environ.get("CUTE_TREE_CONVERT_CHUNKED") == "1"
+                    and self.tile_hdim > 256
+                ):
+                    for rest_m in cutlass.range(cute.size(frag8, mode=[1]), unroll=1):
+                        for rest_n in cutlass.range(cute.size(frag8, mode=[2]), unroll=1):
+                            frag8_part = frag8[None, rest_m, rest_n]
+                            dst_part = dst[None, rest_m, rest_n]
+                            frag16 = cute.make_fragment_like(frag8_part, self.dtype)
+                            if const_expr(self.dtype == cutlass.BFloat16):
+                                frag_mid = cute.make_fragment_like(frag8_part, cutlass.Float16)
+                                frag_mid.store(frag8_part.load().to(cutlass.Float16))
+                                frag16.store(frag_mid.load().to(self.dtype))
+                            else:
+                                frag16.store(frag8_part.load().to(self.dtype))
+                            cute.autovec_copy(frag16, dst_part)
+                else:
+                    frag16 = cute.make_fragment_like(frag8, self.dtype)
+                    if const_expr(self.dtype == cutlass.BFloat16):
+                        # M10b: no direct packed fp8->bf16 cvt lowering; hop through fp16
+                        # (exact for e4m3 source: e4m3 has <= 3 mantissa bits, well within
+                        # both fp16's 10 and bf16's 7, so no extra rounding is introduced).
+                        frag_mid = cute.make_fragment_like(frag8, cutlass.Float16)
+                        frag_mid.store(frag8.load().to(cutlass.Float16))
+                        frag16.store(frag_mid.load().to(self.dtype))
+                    else:
+                        frag16.store(frag8.load().to(self.dtype))
+                    cute.autovec_copy(frag16, dst)
                 cute.arch.fence_view_async_shared()
                 cute.arch.barrier(
                     barrier_id=int(NamedBarrierFwd.VConvert),
