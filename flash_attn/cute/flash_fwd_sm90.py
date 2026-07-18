@@ -532,19 +532,35 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         SharedStorage = self._get_shared_storage_cls()
         if const_expr(os.environ.get("CUTE_TREE_RESOURCE_DIAG") == "1"):
+            sQ_bytes = cute.size_in_bytes(self.dtype, self.sQ_layout)
+            sK_bytes = cute.size_in_bytes(self.dtype, self.sK_layout)
+            sV_bytes = cute.size_in_bytes(self.dtype_pv, self.sV_layout)
+            sP_bytes = (
+                cute.size_in_bytes(self.dtype_pv, self.sP_layout)
+                if const_expr(self.sP_layout is not None)
+                else 0
+            )
+            sK8_bytes = (
+                cute.size_in_bytes(self.dtype_k, self.sK8_layout)
+                if const_expr(self.sK8_layout is not None)
+                else 0
+            )
+            sV8_bytes = (
+                cute.size_in_bytes(self.dtype_v, self.sV8_layout)
+                if const_expr(self.sV8_layout is not None)
+                else 0
+            )
+            mbar_bytes = (1 + 2 * self.num_stages + 2 * self.num_stages) * 8
+            logical_bytes = sQ_bytes + sK_bytes + sV_bytes + sP_bytes + mbar_bytes
             print(
                 "[CUTE_TREE_RESOURCE]"
                 f" tile_m={self.tile_m} tile_n={self.tile_n} stages={self.num_stages}"
                 f" threads={self.num_threads} mma_wg={self.num_wg_mma}"
                 f" regs_mma={self.num_mma_regs} regs_producer={self.num_producer_regs}"
                 f" shared_total={SharedStorage.size_in_bytes()}"
-                f" sQ={sQ_struct.size_in_bytes()} sK={sK_struct.size_in_bytes()}"
-                f" sV={sV_struct.size_in_bytes()} sP={sP_struct.size_in_bytes()}"
-                f" mbar_q={mbar_ptr_Q_struct.size_in_bytes()}"
-                f" mbar_k={mbar_ptr_K_struct.size_in_bytes()}"
-                f" mbar_v={mbar_ptr_V_struct.size_in_bytes()}"
-                f" logical_sK8={sK8_struct.size_in_bytes()}"
-                f" logical_sV8={sV8_struct.size_in_bytes()}"
+                f" logical={logical_bytes} residual={SharedStorage.size_in_bytes() - logical_bytes}"
+                f" sQ={sQ_bytes} sK={sK_bytes} sV={sV_bytes} sP={sP_bytes}"
+                f" mbar={mbar_bytes} logical_sK8={sK8_bytes} logical_sV8={sV8_bytes}"
                 f" alias_convert_smem={self.alias_convert_smem}"
             )
 
